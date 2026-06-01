@@ -6,7 +6,7 @@ import (
 	"errors"
 	"testing"
 
-	"riverqueue.com/riverpro/riverworkflow"
+	"github.com/divyam234/riverpro/riverworkflow"
 )
 
 type testArgs struct{ KindValue string }

@@ -4,18 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"regexp"
 	"sort"
 	"testing"
 	"time"
 
+	"github.com/divyam234/riverpro/driver"
+	"github.com/divyam234/riverpro/riverworkflow"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivertype"
 	"github.com/stretchr/testify/require"
-	"riverqueue.com/riverpro/driver"
-	"riverqueue.com/riverpro/riverworkflow"
 )
 
 var safeIdentRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
@@ -613,7 +614,10 @@ func exerciseDocumentedExecutorAPI[TTx any](ctx context.Context, t *testing.T,
 		require.NoError(t, err)
 		require.NoError(t, proTx.Rollback(ctx))
 
-		locked, err := exec.PGTryAdvisoryXactLock(ctx, 424242)
+		// Use a random lock key so the call doesn't collide with another
+		// driver package's DocumentedExecutorAPI run hitting the same
+		// database in parallel (PostgreSQL advisory locks are global).
+		locked, err := exec.PGTryAdvisoryXactLock(ctx, rand.Int63())
 		require.NoError(t, err)
 		require.True(t, locked)
 

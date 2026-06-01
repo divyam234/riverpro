@@ -10,11 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/divyam234/riverpro"
+	prodriver "github.com/divyam234/riverpro/driver"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivertype"
-	"riverqueue.com/riverpro"
-	prodriver "riverqueue.com/riverpro/driver"
 )
 
 const (

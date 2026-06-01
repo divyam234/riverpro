@@ -3,8 +3,8 @@ package riverprodatabasesql
 import (
 	"database/sql"
 
+	"github.com/divyam234/riverpro/driver"
 	"github.com/riverqueue/river/riverdriver/riverdatabasesql"
-	"riverqueue.com/riverpro/driver"
 )
 
 type Driver = driver.Wrapper[*sql.Tx]

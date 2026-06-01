@@ -16,7 +16,7 @@ import (
 	"github.com/riverqueue/river/rivershared/riverpilot"
 	"github.com/riverqueue/river/rivertype"
 
-	prodriver "riverqueue.com/riverpro/driver"
+	prodriver "github.com/divyam234/riverpro/driver"
 )
 
 const (

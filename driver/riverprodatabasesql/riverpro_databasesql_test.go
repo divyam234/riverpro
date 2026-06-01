@@ -5,13 +5,13 @@ import (
 	"database/sql"
 	"testing"
 
+	"github.com/divyam234/riverpro/driver"
+	"github.com/divyam234/riverpro/driver/riverprodatabasesql"
+	"github.com/divyam234/riverpro/driver/riverprodrivertest"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/stretchr/testify/require"
-	"riverqueue.com/riverpro/driver"
-	"riverqueue.com/riverpro/driver/riverprodatabasesql"
-	"riverqueue.com/riverpro/driver/riverprodrivertest"
 )
 
 func TestDriverRiverProDatabaseSQLPgx(t *testing.T) {

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/divyam234/riverpro/riverencrypt"
 	"golang.org/x/crypto/nacl/secretbox"
-	"riverqueue.com/riverpro/riverencrypt"
 )
 
 const keySize = 32

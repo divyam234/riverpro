@@ -9,9 +9,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/divyam234/riverpro/driver/riverpropgxv5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river/rivermigrate"
-	"riverqueue.com/riverpro/driver/riverpropgxv5"
 )
 
 const usage = `riverpro is the River Pro command line interface.

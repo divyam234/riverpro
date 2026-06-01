@@ -1,4 +1,4 @@
-module riverqueue.com/riverpro
+module github.com/divyam234/riverpro
 
 go 1.25.0
 

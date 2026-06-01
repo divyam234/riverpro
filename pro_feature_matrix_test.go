@@ -17,8 +17,8 @@ import (
 	"github.com/riverqueue/river/rivertype"
 	"github.com/stretchr/testify/require"
 
-	prodriver "riverqueue.com/riverpro/driver"
-	"riverqueue.com/riverpro/driver/riverpropgxv5"
+	prodriver "github.com/divyam234/riverpro/driver"
+	"github.com/divyam234/riverpro/driver/riverpropgxv5"
 )
 
 type matrixBatchArgs struct {

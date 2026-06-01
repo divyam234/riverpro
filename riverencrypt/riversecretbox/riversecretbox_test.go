@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"riverqueue.com/riverpro/riverencrypt"
+	"github.com/divyam234/riverpro/riverencrypt"
 )
 
 func TestEncryptorRoundTripAndKeyRotation(t *testing.T) {

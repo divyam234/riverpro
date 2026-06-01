@@ -4,13 +4,13 @@ import (
 	"context"
 	"testing"
 
+	"github.com/divyam234/riverpro/driver"
+	"github.com/divyam234/riverpro/driver/riverprodrivertest"
+	"github.com/divyam234/riverpro/driver/riverpropgxv5"
 	"github.com/jackc/pgx/v5"
 	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
 	"github.com/stretchr/testify/require"
-	"riverqueue.com/riverpro/driver"
-	"riverqueue.com/riverpro/driver/riverprodrivertest"
-	"riverqueue.com/riverpro/driver/riverpropgxv5"
 )
 
 func TestDriverRiverProPgxV5(t *testing.T) {

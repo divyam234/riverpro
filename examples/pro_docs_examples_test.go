@@ -21,11 +21,11 @@ import (
 	"github.com/riverqueue/river/rivertype"
 	"github.com/stretchr/testify/require"
 
-	"riverqueue.com/riverpro"
-	prodriver "riverqueue.com/riverpro/driver"
-	"riverqueue.com/riverpro/driver/riverpropgxv5"
-	"riverqueue.com/riverpro/riverbatch"
-	"riverqueue.com/riverpro/riverworkflow"
+	"github.com/divyam234/riverpro"
+	prodriver "github.com/divyam234/riverpro/driver"
+	"github.com/divyam234/riverpro/driver/riverpropgxv5"
+	"github.com/divyam234/riverpro/riverbatch"
+	"github.com/divyam234/riverpro/riverworkflow"
 )
 
 const documentedExampleCount = 17

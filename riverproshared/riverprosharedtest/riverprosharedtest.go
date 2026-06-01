@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/divyam234/riverpro/driver/riverpropgxv5"
 	"github.com/jackc/pgx/v5"
 	"github.com/riverqueue/river/riverdbtest"
 	"github.com/riverqueue/river/rivershared/riversharedtest"
-	"riverqueue.com/riverpro/driver/riverpropgxv5"
 )
 
 // TestTxPgxPro starts a test transaction that's rolled back automatically as

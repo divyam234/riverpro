@@ -1,10 +1,10 @@
 package riverpropgxv5
 
 import (
+	"github.com/divyam234/riverpro/driver"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
-	"riverqueue.com/riverpro/driver"
 )
 
 type Driver = driver.Wrapper[pgx.Tx]

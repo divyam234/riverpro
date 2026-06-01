@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/divyam234/riverpro"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/rivertype"
 	"github.com/stretchr/testify/require"
-	"riverqueue.com/riverpro"
 )
 
 type batchTestArgs struct{ Value int }

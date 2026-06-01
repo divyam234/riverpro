@@ -1,0 +1,27 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.dll~
+*.so
+*.dylib
+
+# Test binary (`go test -c`) and coverage output
+*.test
+*.out
+coverage.out
+coverage.html
+*.coverprofile
+
+# Go workspace files (multi-module)
+go.work
+go.work.sum
+
+# Editor / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+*~
+*.swp

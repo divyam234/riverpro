@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
+	prodriver "github.com/divyam234/riverpro/driver"
+	"github.com/divyam234/riverpro/riverworkflow"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/rivertype"
-	prodriver "riverqueue.com/riverpro/driver"
-	"riverqueue.com/riverpro/riverworkflow"
 )
 
 type BatchOpts struct{ ByArgs bool }
