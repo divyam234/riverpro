@@ -1,0 +1,10 @@
+DROP TABLE IF EXISTS /* TEMPLATE: schema */river_workflow_worklist;
+DROP TABLE IF EXISTS /* TEMPLATE: schema */river_workflow_timer;
+DROP TABLE IF EXISTS /* TEMPLATE: schema */river_workflow_signal;
+DROP TABLE IF EXISTS /* TEMPLATE: schema */river_workflow_attempt_task;
+DROP TABLE IF EXISTS /* TEMPLATE: schema */river_workflow_attempt;
+DROP TABLE IF EXISTS /* TEMPLATE: schema */river_workflow;
+DROP TABLE IF EXISTS /* TEMPLATE: schema */river_job_sequence;
+DROP TABLE IF EXISTS /* TEMPLATE: schema */river_producer;
+DROP TABLE IF EXISTS /* TEMPLATE: schema */river_periodic_job;
+DROP TABLE IF EXISTS /* TEMPLATE: schema */river_job_dead_letter;
