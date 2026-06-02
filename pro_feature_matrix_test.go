@@ -338,7 +338,7 @@ func TestProFeatureMatrix_DurablePeriodicJobs_OneShotFires(t *testing.T) {
 		Config: river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
 	})
 
-	_, err := client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
+	_, err := client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
 		ID:   "matrix-once",
 		Kind: "matrix_periodic",
 		Args: []byte(`{"note":"hello"}`),
@@ -380,7 +380,7 @@ func TestProFeatureMatrix_DurablePeriodicJobs_CronFires(t *testing.T) {
 		Config: river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
 	})
 
-	_, err := client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
+	_, err := client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
 		ID:   "matrix-cron",
 		Kind: "matrix_periodic",
 		Args: []byte(`{}`),
@@ -426,13 +426,15 @@ func TestProFeatureMatrix_DurablePeriodicJobs_PauseResume(t *testing.T) {
 		Config: river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
 	})
 
-	_, err := client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
-		ID:   "matrix-pr",
-		Kind: "matrix_periodic",
-		Schedule: &PeriodicJobSchedule{
-			CronExpression: "* * * * *",
-			NextRunAt:      time.Now().Add(-time.Second),
-		},
+	schedule := &PeriodicJobSchedule{
+		CronExpression: "* * * * *",
+		NextRunAt:      time.Now().Add(-time.Second),
+	}
+
+	_, err := client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
+		ID:       "matrix-pr",
+		Kind:     "matrix_periodic",
+		Schedule: schedule,
 	})
 	require.NoError(t, err)
 
@@ -449,8 +451,13 @@ func TestProFeatureMatrix_DurablePeriodicJobs_PauseResume(t *testing.T) {
 		t.Fatal("job did not fire before pause")
 	}
 
-	// Pause it.
-	paused, err := client.PeriodicJobPause(ctx, "matrix-pr")
+	// Pause it via Upsert.
+	paused, err := client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
+		ID:       "matrix-pr",
+		Kind:     "matrix_periodic",
+		Schedule: schedule,
+		Paused:   true,
+	})
 	require.NoError(t, err)
 	require.NotNil(t, paused.PausedAt)
 
@@ -463,16 +470,22 @@ func TestProFeatureMatrix_DurablePeriodicJobs_PauseResume(t *testing.T) {
 		}
 	}
 afterPause:
-	// No calls for 1s while paused.
+	// No calls for 500ms while paused.
 	select {
 	case <-called:
 		t.Fatal("paused job fired")
 	case <-time.After(500 * time.Millisecond):
 	}
 
-	// Resume.
-	_, err = client.PeriodicJobResume(ctx, "matrix-pr")
+	// Resume via Upsert.
+	resumed, err := client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
+		ID:       "matrix-pr",
+		Kind:     "matrix_periodic",
+		Schedule: schedule,
+		Paused:   false,
+	})
 	require.NoError(t, err)
+	require.Nil(t, resumed.PausedAt)
 }
 
 func TestProFeatureMatrix_DurablePeriodicJobs_UpdateSchedule(t *testing.T) {
@@ -488,7 +501,7 @@ func TestProFeatureMatrix_DurablePeriodicJobs_UpdateSchedule(t *testing.T) {
 	})
 
 	// Start as a one-shot.
-	_, err := client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
+	_, err := client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
 		ID:   "matrix-update",
 		Kind: "matrix_periodic",
 		Schedule: &PeriodicJobSchedule{
@@ -499,7 +512,7 @@ func TestProFeatureMatrix_DurablePeriodicJobs_UpdateSchedule(t *testing.T) {
 
 	// Switch to a cron via re-Add (id-based UPSERT).
 	cron := "0 0 * * *"
-	_, err = client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
+	_, err = client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
 		ID:   "matrix-update",
 		Kind: "matrix_periodic",
 		Schedule: &PeriodicJobSchedule{
@@ -525,7 +538,7 @@ func TestProFeatureMatrix_DurablePeriodicJobs_DisabledGating(t *testing.T) {
 		Config: river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
 	})
 
-	_, err := client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
+	_, err := client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
 		ID:   "matrix-disabled",
 		Kind: "matrix_periodic",
 		Schedule: &PeriodicJobSchedule{
@@ -559,7 +572,7 @@ func TestProFeatureMatrix_DurablePeriodicJobs_ListenNotifyWakesEnqueuer(t *testi
 	})
 
 	// Start the client BEFORE adding the row so the listener is open
-	// and the subsequent PeriodicJobAdd NOTIFY is delivered to it.
+	// and the subsequent PeriodicJobUpsert NOTIFY is delivered to it.
 	require.NoError(t, client.Start(ctx))
 	t.Cleanup(func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -568,7 +581,7 @@ func TestProFeatureMatrix_DurablePeriodicJobs_ListenNotifyWakesEnqueuer(t *testi
 	})
 
 	addedAt := time.Now()
-	_, err := client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
+	_, err := client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
 		ID:   "matrix-listen",
 		Kind: "matrix_periodic",
 		Schedule: &PeriodicJobSchedule{

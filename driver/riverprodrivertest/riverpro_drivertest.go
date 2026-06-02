@@ -151,7 +151,7 @@ func exercisePeriodicJobs[TTx any](ctx context.Context, t *testing.T,
 		now := time.Now().UTC().Truncate(time.Microsecond)
 		stale := now.Add(-2 * time.Hour)
 
-		inserted, err := exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "periodic-a", Kind: "kind-a", NextRunAt: now.Add(time.Hour), Schema: schema, UpdatedAt: &stale})
+		inserted, err := exec.PeriodicJobUpsert(ctx, &driver.PeriodicJobUpsertParams{ID: "periodic-a", Kind: "kind-a", NextRunAt: now.Add(time.Hour), Schema: schema, UpdatedAt: &stale})
 		require.NoError(t, err)
 		require.Equal(t, "periodic-a", inserted.ID)
 		require.Equal(t, "kind-a", inserted.Kind)
@@ -162,7 +162,7 @@ func exercisePeriodicJobs[TTx any](ctx context.Context, t *testing.T,
 		require.Equal(t, inserted.ID, got.ID)
 		require.Equal(t, "kind-a", got.Kind)
 
-		upserted, err := exec.PeriodicJobUpsertMany(ctx, &driver.PeriodicJobUpsertManyParams{Schema: schema, Jobs: []*driver.PeriodicJobUpsertParams{
+		upserted, err := exec.PeriodicJobUpsertMany(ctx, &driver.PeriodicJobUpsertManyParams{Schema: schema, Jobs: []*driver.PeriodicJobUpsertItem{
 			{ID: "periodic-a", Kind: "kind-a", NextRunAt: now.Add(2 * time.Hour), UpdatedAt: now},
 			{ID: "periodic-b", Kind: "kind-b", NextRunAt: now.Add(3 * time.Hour), UpdatedAt: stale},
 		}})
@@ -186,7 +186,7 @@ func exercisePeriodicJobs[TTx any](ctx context.Context, t *testing.T,
 		now := time.Now().UTC().Truncate(time.Microsecond)
 		cron := "*/5 * * * *"
 
-		inserted, err := exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{
+		inserted, err := exec.PeriodicJobUpsert(ctx, &driver.PeriodicJobUpsertParams{
 			ID:             "periodic-full",
 			Kind:           "kind-full",
 			NextRunAt:      now,
@@ -225,7 +225,7 @@ func exercisePeriodicJobs[TTx any](ctx context.Context, t *testing.T,
 		exec, schema := execSchema(ctx, t, executorWithTx)
 		now := time.Now().UTC().Truncate(time.Microsecond)
 
-		_, err := exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "periodic-del", Kind: "k", NextRunAt: now, Schema: schema, UpdatedAt: &now})
+		_, err := exec.PeriodicJobUpsert(ctx, &driver.PeriodicJobUpsertParams{ID: "periodic-del", Kind: "k", NextRunAt: now, Schema: schema, UpdatedAt: &now})
 		require.NoError(t, err)
 
 		deleted, err := exec.PeriodicJobDelete(ctx, &driver.PeriodicJobDeleteParams{ID: "periodic-del", Schema: schema})
@@ -237,26 +237,30 @@ func exercisePeriodicJobs[TTx any](ctx context.Context, t *testing.T,
 		require.ErrorIs(t, err, rivertype.ErrNotFound)
 	})
 
-	t.Run("PeriodicJobsPauseResume", func(t *testing.T) {
+	t.Run("PeriodicJobsUpsertPaused", func(t *testing.T) {
 		t.Parallel()
 		exec, schema := execSchema(ctx, t, executorWithTx)
 		now := time.Now().UTC().Truncate(time.Microsecond)
-		pausedAt := now
 
-		_, err := exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "periodic-pr", Kind: "k", NextRunAt: now, Schema: schema, UpdatedAt: &now})
+		// Initial insert (active).
+		active, err := exec.PeriodicJobUpsert(ctx, &driver.PeriodicJobUpsertParams{ID: "periodic-pr", Kind: "k", NextRunAt: now, Schema: schema, UpdatedAt: &now})
 		require.NoError(t, err)
+		require.Nil(t, active.PausedAt)
 
-		paused, err := exec.PeriodicJobPause(ctx, &driver.PeriodicJobPauseParams{ID: "periodic-pr", PausedAt: &pausedAt, Schema: schema})
+		// Pause via Upsert.
+		paused, err := exec.PeriodicJobUpsert(ctx, &driver.PeriodicJobUpsertParams{ID: "periodic-pr", Kind: "k", NextRunAt: now, Schema: schema, UpdatedAt: &now, Paused: true})
 		require.NoError(t, err)
 		require.NotNil(t, paused.PausedAt)
-		require.True(t, pausedAt.Equal(*paused.PausedAt), "expected paused_at %v got %v", pausedAt, *paused.PausedAt)
+		pausedAt := *paused.PausedAt
 
-		// Pausing again leaves the existing paused_at unchanged.
-		pausedAgain, err := exec.PeriodicJobPause(ctx, &driver.PeriodicJobPauseParams{ID: "periodic-pr", PausedAt: &pausedAt, Schema: schema})
+		// Pausing again keeps the existing paused_at (COALESCE).
+		pausedAgain, err := exec.PeriodicJobUpsert(ctx, &driver.PeriodicJobUpsertParams{ID: "periodic-pr", Kind: "k", NextRunAt: now, Schema: schema, UpdatedAt: &now, Paused: true})
 		require.NoError(t, err)
 		require.NotNil(t, pausedAgain.PausedAt)
+		require.True(t, pausedAt.Equal(*pausedAgain.PausedAt), "expected paused_at %v got %v", pausedAt, *pausedAgain.PausedAt)
 
-		resumed, err := exec.PeriodicJobResume(ctx, &driver.PeriodicJobResumeParams{ID: "periodic-pr", Schema: schema})
+		// Resume via Upsert.
+		resumed, err := exec.PeriodicJobUpsert(ctx, &driver.PeriodicJobUpsertParams{ID: "periodic-pr", Kind: "k", NextRunAt: now, Schema: schema, UpdatedAt: &now, Paused: false})
 		require.NoError(t, err)
 		require.Nil(t, resumed.PausedAt)
 	})
@@ -268,18 +272,16 @@ func exercisePeriodicJobs[TTx any](ctx context.Context, t *testing.T,
 		cronExpr := "*/5 * * * *"
 
 		// One-shot, due now.
-		_, err := exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "p-once", Kind: "k", NextRunAt: now.Add(-time.Hour), Schema: schema, UpdatedAt: &now, Args: []byte(`{"i":1}`)})
+		_, err := exec.PeriodicJobUpsert(ctx, &driver.PeriodicJobUpsertParams{ID: "p-once", Kind: "k", NextRunAt: now.Add(-time.Hour), Schema: schema, UpdatedAt: &now, Args: []byte(`{"i":1}`)})
 		require.NoError(t, err)
 		// Cron, due now.
-		_, err = exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "p-cron", Kind: "k", NextRunAt: now.Add(-time.Hour), Schema: schema, UpdatedAt: &now, Args: []byte(`{"i":2}`), CronExpression: &cronExpr, CronTimezone: "UTC"})
+		_, err = exec.PeriodicJobUpsert(ctx, &driver.PeriodicJobUpsertParams{ID: "p-cron", Kind: "k", NextRunAt: now.Add(-time.Hour), Schema: schema, UpdatedAt: &now, Args: []byte(`{"i":2}`), CronExpression: &cronExpr, CronTimezone: "UTC"})
 		require.NoError(t, err)
 		// Future, should NOT be enqueued.
-		_, err = exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "p-future", Kind: "k", NextRunAt: now.Add(time.Hour), Schema: schema, UpdatedAt: &now})
+		_, err = exec.PeriodicJobUpsert(ctx, &driver.PeriodicJobUpsertParams{ID: "p-future", Kind: "k", NextRunAt: now.Add(time.Hour), Schema: schema, UpdatedAt: &now})
 		require.NoError(t, err)
 		// Paused, should NOT be enqueued.
-		_, err = exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "p-paused", Kind: "k", NextRunAt: now.Add(-time.Hour), Schema: schema, UpdatedAt: &now})
-		require.NoError(t, err)
-		_, err = exec.PeriodicJobPause(ctx, &driver.PeriodicJobPauseParams{ID: "p-paused", PausedAt: &now, Schema: schema})
+		_, err = exec.PeriodicJobUpsert(ctx, &driver.PeriodicJobUpsertParams{ID: "p-paused", Kind: "k", NextRunAt: now.Add(-time.Hour), Schema: schema, UpdatedAt: &now, Paused: true})
 		require.NoError(t, err)
 
 		// Caller-supplied next tick for the cron row.

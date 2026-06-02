@@ -68,8 +68,8 @@ func TestCompatibilityPeriodicAndSignalStore(t *testing.T) {
 	schema := "test_schema_compat_store"
 	now := time.Now().UTC()
 
-	if _, err := exec.PeriodicJobInsert(ctx, &PeriodicJobInsertParams{ID: "periodic-a", NextRunAt: now, Schema: schema, UpdatedAt: &now}); err != nil {
-		t.Fatalf("PeriodicJobInsert: %v", err)
+	if _, err := exec.PeriodicJobUpsert(ctx, &PeriodicJobUpsertParams{ID: "periodic-a", NextRunAt: now, Schema: schema, UpdatedAt: &now}); err != nil {
+		t.Fatalf("PeriodicJobUpsert: %v", err)
 	}
 	periodic, err := exec.PeriodicJobGetByID(ctx, &PeriodicJobGetByIDParams{ID: "periodic-a", Schema: schema})
 	if err != nil {
