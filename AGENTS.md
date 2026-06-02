@@ -6,6 +6,7 @@ River Pro — a Go extension on top of [River](https://github.com/riverqueue/riv
 
 ```
 riverpro.go                 public API: Config, Client, NewClient, Pilot integration entry point
+periodic_jobs.go            durable periodic jobs: Add/Get/List/Delete/Pause/Resume + enqueuer loop
 pro_pilot.go                riverpilot.Pilot impl — injects Pro metadata + sequence handling on insert
 pro_feature_matrix_test.go  end-to-end Pro feature tests (real DB)
 riverpro_test.go            pure-Go unit tests for workflow preparation / config
@@ -53,6 +54,19 @@ Go runs different test packages in parallel by default, and `riverprodatabasesql
 - Apply via the CLI: `go run ./cmd/riverpro migrate-up --database-url "$TEST_DATABASE_URL" --line pro [--schema <name>]`.
 - For dry-run / SQL inspection: `migrate-get --line pro --version 1 --up`.
 - The CLI also accepts `--dry-run`, `--max-steps`, `--target-version`. Defaults to `DATABASE_URL` env var if `--database-url` is empty.
+- `002_add_periodic_admin_and_spec` extends `river_periodic_job` with `paused_at`, `kind`, `args` (jsonb), `queue`, `priority`, `max_attempts`, `tags`, `cron_expression`, `cron_timezone`, plus indexes `river_periodic_job_active_next_run_at_idx` and `river_periodic_job_kind_idx`. The Pro enqueuer loop relies on all of these.
+
+## Durable Periodic Jobs
+
+- Pro-only; opt in via `Config.DurablePeriodicJobs.Enabled = true`. OSS users continue to use upstream `river.Client.AddPeriodicJob` (the Pro enqueuer loop short-circuits when disabled).
+- Pro owns `river_periodic_job` entirely: when enabled, the pilot's `PeriodicJobGetAll` / `KeepAliveAndReap` / `UpsertMany` overrides return `nil` so the upstream enqueuer does no work.
+- Public admin API on `*Client[TTx]`: `PeriodicJobAdd` (UPSERT — to change schedule, call Add again with the same id and new spec), `PeriodicJobGet`, `PeriodicJobList`, `PeriodicJobDelete`, `PeriodicJobPause`, `PeriodicJobResume` (+ `Tx` variants). Gated with `prodriver.ErrNotSupported` when disabled.
+- One-shot rows (`CronExpression == ""`): `river_job` row inserted and `river_periodic_job` row deleted in the same statement chain.
+- Cron rows (`CronExpression != ""`): `river_job` row inserted; `river_periodic_job` row kept; `next_run_at` bumped to the next tick computed by the enqueuer loop using `github.com/robfig/cron/v3`. Driver stays free of the cron dep — it accepts the `NextRunAt` map from the client.
+- **LISTEN/NOTIFY wakeup**: each admin method (`PeriodicJobInsert`/`Delete`/`Pause`/`Resume`) fires `pg_notify('<schema>.river_periodic_job_change', '')` in the same SQL statement chain, so the notification is rolled back if the change rolls back. Topic suffix is exported as `prodriver.PeriodicJobChangeTopicSuffix`; full topic is `<schema>.river_periodic_job_change` (or just the suffix when `Schema == ""`). Postgres topic length limit is 63 chars — keep schema names short.
+- The enqueuer loop (`Start` → `periodicEnqueuerLoop`) opens a dedicated connection via `c.proDriver.GetListener(...)`, `LISTEN`s on the schema-prefixed topic, and runs `periodicEnqueueOnce` on every notification. A 30s safety-net ticker fires even in LISTEN mode to catch any missed notifications. Per-tick work is gated on a Postgres `pg_try_advisory_lock(bigint)` keyed on a per-process random int63 (`periodicEnqueuerLockKey`). Released at the end of each iteration.
+- **Polling fallback**: if `Config.DurablePeriodicJobs.PollOnly` is true, or the driver does not support listeners (`!c.proDriver.SupportsListener()`), or the listener fails to `Connect`/`Listen` on startup, the loop falls back to `periodicEnqueuerPollingLoop` which polls at `DurablePeriodicJobs.PollInterval` (default 1s).
+- Cron is parsed with `cron.NewParser(Minute|Hour|Dom|Month|Dow|Descriptor)` in `cronNextAfter`; standard 5-field spec plus `@hourly` / `@daily` / `@weekly` / `@monthly` / `@yearly` / `@every <duration>` descriptors.
 
 ## Common commands
 

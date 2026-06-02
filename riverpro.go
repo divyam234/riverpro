@@ -105,13 +105,22 @@ func (c *Config) WithDefaults() *Config {
 	if c.DurablePeriodicJobs.StartStaggerThreshold == 0 {
 		c.DurablePeriodicJobs.StartStaggerThreshold = 500
 	}
+	if c.DurablePeriodicJobs.PollInterval == 0 {
+		c.DurablePeriodicJobs.PollInterval = time.Second
+	}
 	return c
 }
 
 type DeadLetterConfig struct{ Enabled bool }
 type DurablePeriodicJobsConfig struct {
 	Enabled               bool
+	// PollOnly disables LISTEN/NOTIFY-based wakeup of the enqueuer
+	// loop. When true the loop polls at PollInterval regardless of
+	// driver support. Useful for drivers without working LISTEN/NOTIFY
+	// or for predictable test timing.
+	PollOnly              bool
 	NextRunAtRatchetFunc  func(nextRunAt, now time.Time) time.Time
+	PollInterval          time.Duration
 	StaleThreshold        time.Duration
 	StartStaggerSpread    time.Duration
 	StartStaggerThreshold int
@@ -226,6 +235,7 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	go c.queueRetentionCleanerLoop(ctx)
 	go c.workflowRetentionCleanerLoop(ctx)
 	go c.producerRetentionCleanerLoop(ctx)
+	go c.periodicEnqueuerLoop(ctx)
 	return nil
 }
 

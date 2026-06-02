@@ -71,7 +71,7 @@ func TestMigrateUpMainThenPro(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM `+schema+`.river_migration WHERE line = 'pro'`).Scan(&proCount); err != nil {
 		t.Fatalf("query pro migrations: %v", err)
 	}
-	if mainCount == 0 || proCount != 1 {
+	if mainCount == 0 || proCount != 2 {
 		t.Fatalf("unexpected migration counts: main=%d pro=%d", mainCount, proCount)
 	}
 }

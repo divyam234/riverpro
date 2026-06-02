@@ -140,53 +140,25 @@ func (p *proPilot[TTx]) PeriodicJobGetAll(ctx context.Context, exec riverdriver.
 	if p.config == nil || !p.config.DurablePeriodicJobs.Enabled {
 		return p.StandardPilot.PeriodicJobGetAll(ctx, exec, params)
 	}
-	jobs, err := (&prodriver.Executor{Executor: exec}).PeriodicJobGetAll(ctx, &prodriver.PeriodicJobGetAllParams{Schema: params.Schema})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]*riverpilot.PeriodicJob, 0, len(jobs))
-	for _, j := range jobs {
-		out = append(out, &riverpilot.PeriodicJob{ID: j.ID, CreatedAt: j.CreatedAt, NextRunAt: j.NextRunAt, UpdatedAt: j.UpdatedAt})
-	}
-	return out, nil
+	// Pro owns the table: the upstream enqueuer must do no work.
+	return nil, nil
 }
 
 func (p *proPilot[TTx]) PeriodicJobKeepAliveAndReap(ctx context.Context, exec riverdriver.Executor, params *riverpilot.PeriodicJobKeepAliveAndReapParams) ([]*riverpilot.PeriodicJob, error) {
 	if p.config == nil || !p.config.DurablePeriodicJobs.Enabled {
 		return p.StandardPilot.PeriodicJobKeepAliveAndReap(ctx, exec, params)
 	}
-	stale := time.Now().Add(-p.config.DurablePeriodicJobs.StaleThreshold)
-	jobs, err := (&prodriver.Executor{Executor: exec}).PeriodicJobKeepAliveAndReap(ctx, &prodriver.PeriodicJobKeepAliveAndReapParams{ID: params.ID, Schema: params.Schema, StaleUpdatedAtHorizon: stale})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]*riverpilot.PeriodicJob, 0, len(jobs))
-	for _, j := range jobs {
-		out = append(out, &riverpilot.PeriodicJob{ID: j.ID, CreatedAt: j.CreatedAt, NextRunAt: j.NextRunAt, UpdatedAt: j.UpdatedAt})
-	}
-	return out, nil
+	// Pro owns the table: the upstream enqueuer must do no work.
+	return nil, nil
 }
 
 func (p *proPilot[TTx]) PeriodicJobUpsertMany(ctx context.Context, exec riverdriver.Executor, params *riverpilot.PeriodicJobUpsertManyParams) ([]*riverpilot.PeriodicJob, error) {
 	if p.config == nil || !p.config.DurablePeriodicJobs.Enabled {
 		return p.StandardPilot.PeriodicJobUpsertMany(ctx, exec, params)
 	}
-	upserts := make([]*prodriver.PeriodicJobUpsertParams, 0, len(params.Jobs))
-	for _, j := range params.Jobs {
-		if j == nil {
-			continue
-		}
-		upserts = append(upserts, &prodriver.PeriodicJobUpsertParams{ID: j.ID, NextRunAt: p.config.DurablePeriodicJobs.NextRunAtRatchetFunc(j.NextRunAt, time.Now()), UpdatedAt: j.UpdatedAt})
-	}
-	jobs, err := (&prodriver.Executor{Executor: exec}).PeriodicJobUpsertMany(ctx, &prodriver.PeriodicJobUpsertManyParams{Jobs: upserts, Schema: params.Schema})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]*riverpilot.PeriodicJob, 0, len(jobs))
-	for _, j := range jobs {
-		out = append(out, &riverpilot.PeriodicJob{ID: j.ID, CreatedAt: j.CreatedAt, NextRunAt: j.NextRunAt, UpdatedAt: j.UpdatedAt})
-	}
-	return out, nil
+	// Pro owns the table: the upstream enqueuer must do no work. Calls
+	// from the user side go through Client.PeriodicJobAdd instead.
+	return nil, nil
 }
 
 func (p *proPilot[TTx]) ProducerInit(ctx context.Context, exec riverdriver.Executor, params *riverpilot.ProducerInitParams) (int64, riverpilot.ProducerState, error) {

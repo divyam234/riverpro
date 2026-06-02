@@ -151,18 +151,20 @@ func exercisePeriodicJobs[TTx any](ctx context.Context, t *testing.T,
 		now := time.Now().UTC().Truncate(time.Microsecond)
 		stale := now.Add(-2 * time.Hour)
 
-		inserted, err := exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "periodic-a", NextRunAt: now.Add(time.Hour), Schema: schema, UpdatedAt: &stale})
+		inserted, err := exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "periodic-a", Kind: "kind-a", NextRunAt: now.Add(time.Hour), Schema: schema, UpdatedAt: &stale})
 		require.NoError(t, err)
 		require.Equal(t, "periodic-a", inserted.ID)
+		require.Equal(t, "kind-a", inserted.Kind)
 		requireRowCount(ctx, t, exec, schema, "river_periodic_job", 1)
 
 		got, err := exec.PeriodicJobGetByID(ctx, &driver.PeriodicJobGetByIDParams{ID: "periodic-a", Schema: schema})
 		require.NoError(t, err)
 		require.Equal(t, inserted.ID, got.ID)
+		require.Equal(t, "kind-a", got.Kind)
 
 		upserted, err := exec.PeriodicJobUpsertMany(ctx, &driver.PeriodicJobUpsertManyParams{Schema: schema, Jobs: []*driver.PeriodicJobUpsertParams{
-			{ID: "periodic-a", NextRunAt: now.Add(2 * time.Hour), UpdatedAt: now},
-			{ID: "periodic-b", NextRunAt: now.Add(3 * time.Hour), UpdatedAt: stale},
+			{ID: "periodic-a", Kind: "kind-a", NextRunAt: now.Add(2 * time.Hour), UpdatedAt: now},
+			{ID: "periodic-b", Kind: "kind-b", NextRunAt: now.Add(3 * time.Hour), UpdatedAt: stale},
 		}})
 		require.NoError(t, err)
 		require.Len(t, upserted, 2)
@@ -176,6 +178,132 @@ func exercisePeriodicJobs[TTx any](ctx context.Context, t *testing.T,
 		require.NoError(t, err)
 		require.Equal(t, []string{"periodic-b"}, periodicIDs(reaped))
 		requireRowCount(ctx, t, exec, schema, "river_periodic_job", 1)
+	})
+
+	t.Run("PeriodicJobsFullSpec", func(t *testing.T) {
+		t.Parallel()
+		exec, schema := execSchema(ctx, t, executorWithTx)
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		cron := "*/5 * * * *"
+
+		inserted, err := exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{
+			ID:             "periodic-full",
+			Kind:           "kind-full",
+			NextRunAt:      now,
+			Schema:         schema,
+			UpdatedAt:      &now,
+			Args:           []byte(`{"hello":"world"}`),
+			Queue:          "queue-a",
+			Priority:       3,
+			MaxAttempts:    7,
+			Tags:           []string{"alpha", "beta"},
+			CronExpression: &cron,
+			CronTimezone:   "UTC",
+		})
+		require.NoError(t, err)
+		require.Equal(t, "periodic-full", inserted.ID)
+		require.Equal(t, "kind-full", inserted.Kind)
+		require.JSONEq(t, `{"hello":"world"}`, string(inserted.Args))
+		require.Equal(t, "queue-a", inserted.Queue)
+		require.Equal(t, 3, inserted.Priority)
+		require.Equal(t, 7, inserted.MaxAttempts)
+		require.Equal(t, []string{"alpha", "beta"}, inserted.Tags)
+		require.NotNil(t, inserted.CronExpression)
+		require.Equal(t, "*/5 * * * *", *inserted.CronExpression)
+		require.Equal(t, "UTC", inserted.CronTimezone)
+		require.JSONEq(t, `{"hello":"world"}`, string(inserted.Args))
+
+		got, err := exec.PeriodicJobGetByID(ctx, &driver.PeriodicJobGetByIDParams{ID: "periodic-full", Schema: schema})
+		require.NoError(t, err)
+		require.Equal(t, inserted.ID, got.ID)
+		require.JSONEq(t, `{"hello":"world"}`, string(got.Args))
+		require.Equal(t, []string{"alpha", "beta"}, got.Tags)
+	})
+
+	t.Run("PeriodicJobsDelete", func(t *testing.T) {
+		t.Parallel()
+		exec, schema := execSchema(ctx, t, executorWithTx)
+		now := time.Now().UTC().Truncate(time.Microsecond)
+
+		_, err := exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "periodic-del", Kind: "k", NextRunAt: now, Schema: schema, UpdatedAt: &now})
+		require.NoError(t, err)
+
+		deleted, err := exec.PeriodicJobDelete(ctx, &driver.PeriodicJobDeleteParams{ID: "periodic-del", Schema: schema})
+		require.NoError(t, err)
+		require.Equal(t, "periodic-del", deleted.ID)
+		requireRowCount(ctx, t, exec, schema, "river_periodic_job", 0)
+
+		_, err = exec.PeriodicJobDelete(ctx, &driver.PeriodicJobDeleteParams{ID: "periodic-del", Schema: schema})
+		require.ErrorIs(t, err, rivertype.ErrNotFound)
+	})
+
+	t.Run("PeriodicJobsPauseResume", func(t *testing.T) {
+		t.Parallel()
+		exec, schema := execSchema(ctx, t, executorWithTx)
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		pausedAt := now
+
+		_, err := exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "periodic-pr", Kind: "k", NextRunAt: now, Schema: schema, UpdatedAt: &now})
+		require.NoError(t, err)
+
+		paused, err := exec.PeriodicJobPause(ctx, &driver.PeriodicJobPauseParams{ID: "periodic-pr", PausedAt: &pausedAt, Schema: schema})
+		require.NoError(t, err)
+		require.NotNil(t, paused.PausedAt)
+		require.True(t, pausedAt.Equal(*paused.PausedAt), "expected paused_at %v got %v", pausedAt, *paused.PausedAt)
+
+		// Pausing again leaves the existing paused_at unchanged.
+		pausedAgain, err := exec.PeriodicJobPause(ctx, &driver.PeriodicJobPauseParams{ID: "periodic-pr", PausedAt: &pausedAt, Schema: schema})
+		require.NoError(t, err)
+		require.NotNil(t, pausedAgain.PausedAt)
+
+		resumed, err := exec.PeriodicJobResume(ctx, &driver.PeriodicJobResumeParams{ID: "periodic-pr", Schema: schema})
+		require.NoError(t, err)
+		require.Nil(t, resumed.PausedAt)
+	})
+
+	t.Run("PeriodicJobsEnqueueDue", func(t *testing.T) {
+		t.Parallel()
+		exec, schema := execSchema(ctx, t, executorWithTx)
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		cronExpr := "*/5 * * * *"
+
+		// One-shot, due now.
+		_, err := exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "p-once", Kind: "k", NextRunAt: now.Add(-time.Hour), Schema: schema, UpdatedAt: &now, Args: []byte(`{"i":1}`)})
+		require.NoError(t, err)
+		// Cron, due now.
+		_, err = exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "p-cron", Kind: "k", NextRunAt: now.Add(-time.Hour), Schema: schema, UpdatedAt: &now, Args: []byte(`{"i":2}`), CronExpression: &cronExpr, CronTimezone: "UTC"})
+		require.NoError(t, err)
+		// Future, should NOT be enqueued.
+		_, err = exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "p-future", Kind: "k", NextRunAt: now.Add(time.Hour), Schema: schema, UpdatedAt: &now})
+		require.NoError(t, err)
+		// Paused, should NOT be enqueued.
+		_, err = exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{ID: "p-paused", Kind: "k", NextRunAt: now.Add(-time.Hour), Schema: schema, UpdatedAt: &now})
+		require.NoError(t, err)
+		_, err = exec.PeriodicJobPause(ctx, &driver.PeriodicJobPauseParams{ID: "p-paused", PausedAt: &now, Schema: schema})
+		require.NoError(t, err)
+
+		// Caller-supplied next tick for the cron row.
+		nextTick := now.Add(5 * time.Minute)
+		res, err := exec.PeriodicJobEnqueueDue(ctx, &driver.PeriodicJobEnqueueDueParams{
+			Max:       100,
+			NextRunAt: map[string]time.Time{"p-cron": nextTick},
+			Schema:    schema,
+		})
+		require.NoError(t, err)
+		require.Len(t, res.Inserted, 2)
+		require.Equal(t, []string{"p-once"}, res.Deleted)
+
+		// One-shot row gone; cron row updated to nextTick; future/paused untouched.
+		_, err = exec.PeriodicJobGetByID(ctx, &driver.PeriodicJobGetByIDParams{ID: "p-once", Schema: schema})
+		require.ErrorIs(t, err, rivertype.ErrNotFound)
+
+		cronRow, err := exec.PeriodicJobGetByID(ctx, &driver.PeriodicJobGetByIDParams{ID: "p-cron", Schema: schema})
+		require.NoError(t, err)
+		require.True(t, nextTick.Equal(cronRow.NextRunAt), "expected %v got %v", nextTick, cronRow.NextRunAt)
+
+		futureRow, err := exec.PeriodicJobGetByID(ctx, &driver.PeriodicJobGetByIDParams{ID: "p-future", Schema: schema})
+		require.NoError(t, err)
+		require.True(t, now.Add(time.Hour).Equal(futureRow.NextRunAt), "expected %v got %v", now.Add(time.Hour), futureRow.NextRunAt)
 	})
 }
 

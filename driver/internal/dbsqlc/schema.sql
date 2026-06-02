@@ -41,7 +41,16 @@ CREATE TABLE river_periodic_job (
     id text PRIMARY KEY,
     created_at timestamptz NOT NULL DEFAULT now(),
     next_run_at timestamptz NOT NULL,
-    updated_at timestamptz NOT NULL DEFAULT now()
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    paused_at timestamptz,
+    kind text NOT NULL DEFAULT '',
+    args jsonb NOT NULL DEFAULT '{}'::jsonb,
+    queue text NOT NULL DEFAULT 'default',
+    priority smallint NOT NULL DEFAULT 0,
+    max_attempts smallint NOT NULL DEFAULT 0,
+    tags text[] NOT NULL DEFAULT '{}',
+    cron_expression text,
+    cron_timezone text NOT NULL DEFAULT 'UTC'
 );
 CREATE UNIQUE INDEX river_producer_client_queue_key ON river_producer(client_id, queue_name);
 

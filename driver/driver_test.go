@@ -46,7 +46,12 @@ func TestMigrationLinesAndFS(t *testing.T) {
 	if migrationFS == nil {
 		t.Fatal("expected migration FS for pro line")
 	}
-	for _, name := range []string{"001_create_river_pro_schema.up.sql", "001_create_river_pro_schema.down.sql"} {
+	for _, name := range []string{
+		"001_create_river_pro_schema.up.sql",
+		"001_create_river_pro_schema.down.sql",
+		"002_add_periodic_admin_and_spec.up.sql",
+		"002_add_periodic_admin_and_spec.down.sql",
+	} {
 		data, err := fs.ReadFile(migrationFS, "migration/pro/"+name)
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)

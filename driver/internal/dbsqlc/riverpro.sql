@@ -188,6 +188,28 @@ JOIN unnest(sqlc.arg(updated_ats)::timestamptz[]) WITH ORDINALITY AS ups(updated
 ON CONFLICT (id) DO UPDATE SET next_run_at = excluded.next_run_at, updated_at = excluded.updated_at
 RETURNING *;
 
+-- name: PeriodicJobDelete :one
+DELETE FROM /* TEMPLATE: schema */river_periodic_job
+WHERE id = @id
+RETURNING *;
+
+-- name: PeriodicJobPause :one
+UPDATE /* TEMPLATE: schema */river_periodic_job
+SET paused_at = coalesce(sqlc.narg(paused_at)::timestamptz, now()),
+    updated_at = now()
+WHERE id = @id
+  AND paused_at IS NULL
+RETURNING *;
+
+-- name: PeriodicJobResume :one
+UPDATE /* TEMPLATE: schema */river_periodic_job
+SET paused_at = NULL,
+    next_run_at = CASE WHEN @set_next_run_at::boolean THEN sqlc.narg(next_run_at)::timestamptz ELSE next_run_at END,
+    updated_at = now()
+WHERE id = @id
+  AND paused_at IS NOT NULL
+RETURNING *;
+
 -- name: ProducerDelete :exec
 DELETE FROM /* TEMPLATE: schema */river_producer WHERE id = @id;
 

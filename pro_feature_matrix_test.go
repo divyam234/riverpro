@@ -304,4 +304,310 @@ type matrixNoopArgs struct{}
 
 func (matrixNoopArgs) Kind() string { return "matrix_noop" }
 
+type matrixPeriodicArgs struct {
+	Note string `json:"note"`
+}
+
+func (matrixPeriodicArgs) Kind() string { return "matrix_periodic" }
+
+type matrixPeriodicWorker struct {
+	river.WorkerDefaults[matrixPeriodicArgs]
+	called chan struct{}
+}
+
+func (w *matrixPeriodicWorker) Work(ctx context.Context, job *river.Job[matrixPeriodicArgs]) error {
+	if w.called != nil {
+		select {
+		case w.called <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+
+func TestProFeatureMatrix_DurablePeriodicJobs_OneShotFires(t *testing.T) {
+	ctx := context.Background()
+	workers := river.NewWorkers()
+	called := make(chan struct{}, 8)
+	river.AddWorker[matrixPeriodicArgs](workers, &matrixPeriodicWorker{called: called})
+	client, _, schema := newMatrixClient(t, ctx, &Config{
+		DurablePeriodicJobs: DurablePeriodicJobsConfig{
+			Enabled:      true,
+			PollInterval: 50 * time.Millisecond,
+		},
+		Config: river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
+	})
+
+	_, err := client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
+		ID:   "matrix-once",
+		Kind: "matrix_periodic",
+		Args: []byte(`{"note":"hello"}`),
+		Schedule: &PeriodicJobSchedule{
+			NextRunAt: time.Now().Add(-time.Second),
+		},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, client.Start(ctx))
+	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = client.Stop(stopCtx)
+	})
+
+	select {
+	case <-called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("periodic job did not fire within 5s")
+	}
+
+	// One-shot row should be gone now.
+	_, err = client.PeriodicJobGet(ctx, "matrix-once")
+	require.ErrorIs(t, err, rivertype.ErrNotFound)
+	_ = schema
+}
+
+func TestProFeatureMatrix_DurablePeriodicJobs_CronFires(t *testing.T) {
+	ctx := context.Background()
+	workers := river.NewWorkers()
+	called := make(chan struct{}, 16)
+	river.AddWorker[matrixPeriodicArgs](workers, &matrixPeriodicWorker{called: called})
+	client, _, _ := newMatrixClient(t, ctx, &Config{
+		DurablePeriodicJobs: DurablePeriodicJobsConfig{
+			Enabled:      true,
+			PollInterval: 50 * time.Millisecond,
+		},
+		Config: river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
+	})
+
+	_, err := client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
+		ID:   "matrix-cron",
+		Kind: "matrix_periodic",
+		Args: []byte(`{}`),
+		Schedule: &PeriodicJobSchedule{
+			CronExpression: "* * * * *",
+			CronTimezone:   "UTC",
+			NextRunAt:      time.Now().Add(-time.Second),
+		},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, client.Start(ctx))
+	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = client.Stop(stopCtx)
+	})
+
+	// First fire.
+	select {
+	case <-called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cron job did not fire within 5s")
+	}
+
+	// Row should still exist (cron keeps it).
+	got, err := client.PeriodicJobGet(ctx, "matrix-cron")
+	require.NoError(t, err)
+	require.NotNil(t, got.CronExpression)
+	require.Equal(t, "* * * * *", *got.CronExpression)
+}
+
+func TestProFeatureMatrix_DurablePeriodicJobs_PauseResume(t *testing.T) {
+	ctx := context.Background()
+	workers := river.NewWorkers()
+	called := make(chan struct{}, 8)
+	river.AddWorker[matrixPeriodicArgs](workers, &matrixPeriodicWorker{called: called})
+	client, _, _ := newMatrixClient(t, ctx, &Config{
+		DurablePeriodicJobs: DurablePeriodicJobsConfig{
+			Enabled:      true,
+			PollInterval: 50 * time.Millisecond,
+		},
+		Config: river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
+	})
+
+	_, err := client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
+		ID:   "matrix-pr",
+		Kind: "matrix_periodic",
+		Schedule: &PeriodicJobSchedule{
+			CronExpression: "* * * * *",
+			NextRunAt:      time.Now().Add(-time.Second),
+		},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, client.Start(ctx))
+	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = client.Stop(stopCtx)
+	})
+
+	select {
+	case <-called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("job did not fire before pause")
+	}
+
+	// Pause it.
+	paused, err := client.PeriodicJobPause(ctx, "matrix-pr")
+	require.NoError(t, err)
+	require.NotNil(t, paused.PausedAt)
+
+	// Drain any pending calls.
+	for {
+		select {
+		case <-called:
+		case <-time.After(100 * time.Millisecond):
+			goto afterPause
+		}
+	}
+afterPause:
+	// No calls for 1s while paused.
+	select {
+	case <-called:
+		t.Fatal("paused job fired")
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	// Resume.
+	_, err = client.PeriodicJobResume(ctx, "matrix-pr")
+	require.NoError(t, err)
+}
+
+func TestProFeatureMatrix_DurablePeriodicJobs_UpdateSchedule(t *testing.T) {
+	ctx := context.Background()
+	workers := river.NewWorkers()
+	river.AddWorker[matrixPeriodicArgs](workers, &matrixPeriodicWorker{called: make(chan struct{}, 8)})
+	client, _, _ := newMatrixClient(t, ctx, &Config{
+		DurablePeriodicJobs: DurablePeriodicJobsConfig{
+			Enabled:      true,
+			PollInterval: 50 * time.Millisecond,
+		},
+		Config: river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
+	})
+
+	// Start as a one-shot.
+	_, err := client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
+		ID:   "matrix-update",
+		Kind: "matrix_periodic",
+		Schedule: &PeriodicJobSchedule{
+			NextRunAt: time.Now().Add(-time.Second),
+		},
+	})
+	require.NoError(t, err)
+
+	// Switch to a cron via re-Add (id-based UPSERT).
+	cron := "0 0 * * *"
+	_, err = client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
+		ID:   "matrix-update",
+		Kind: "matrix_periodic",
+		Schedule: &PeriodicJobSchedule{
+			CronExpression: cron,
+			CronTimezone:   "UTC",
+			NextRunAt:      time.Now().Add(-time.Second),
+		},
+	})
+	require.NoError(t, err)
+
+	got, err := client.PeriodicJobGet(ctx, "matrix-update")
+	require.NoError(t, err)
+	require.NotNil(t, got.CronExpression)
+	require.Equal(t, "0 0 * * *", *got.CronExpression)
+}
+
+func TestProFeatureMatrix_DurablePeriodicJobs_DisabledGating(t *testing.T) {
+	ctx := context.Background()
+	workers := river.NewWorkers()
+	river.AddWorker[matrixPeriodicArgs](workers, &matrixPeriodicWorker{called: make(chan struct{}, 1)})
+	// No DurablePeriodicJobs enabled.
+	client, _, _ := newMatrixClient(t, ctx, &Config{
+		Config: river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
+	})
+
+	_, err := client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
+		ID:   "matrix-disabled",
+		Kind: "matrix_periodic",
+		Schedule: &PeriodicJobSchedule{
+			NextRunAt: time.Now().Add(-time.Second),
+		},
+	})
+	require.ErrorIs(t, err, prodriver.ErrNotSupported)
+
+	_, err = client.PeriodicJobList(ctx, nil)
+	require.ErrorIs(t, err, prodriver.ErrNotSupported)
+}
+
+// TestProFeatureMatrix_DurablePeriodicJobs_ListenNotifyWakesEnqueuer
+// verifies that adding a due periodic job wakes the enqueuer loop
+// via LISTEN/NOTIFY — not via the 1s polling tick. With PollOnly=false
+// the worker should fire well under 1s after the Add call.
+func TestProFeatureMatrix_DurablePeriodicJobs_ListenNotifyWakesEnqueuer(t *testing.T) {
+	ctx := context.Background()
+	workers := river.NewWorkers()
+	called := make(chan time.Time, 8)
+	river.AddWorker[matrixPeriodicArgs](workers, &matrixPeriodicArgsWorker{when: called})
+	// PollInterval is set to a deliberately long 5s. If the loop falls
+	// back to polling (or if the LISTEN/NOTIFY path is broken) the test
+	// will hang. Successful LISTEN wakeup is well under 1s.
+	client, _, _ := newMatrixClient(t, ctx, &Config{
+		DurablePeriodicJobs: DurablePeriodicJobsConfig{
+			Enabled:      true,
+			PollInterval: 5 * time.Second,
+		},
+		Config: river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
+	})
+
+	// Start the client BEFORE adding the row so the listener is open
+	// and the subsequent PeriodicJobAdd NOTIFY is delivered to it.
+	require.NoError(t, client.Start(ctx))
+	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = client.Stop(stopCtx)
+	})
+
+	addedAt := time.Now()
+	_, err := client.PeriodicJobAdd(ctx, &PeriodicJobAddOpts{
+		ID:   "matrix-listen",
+		Kind: "matrix_periodic",
+		Schedule: &PeriodicJobSchedule{
+			NextRunAt: addedAt.Add(-time.Second),
+		},
+	})
+	require.NoError(t, err)
+
+	select {
+	case <-called:
+		// The wakeup latency is from Add to worker. With LISTEN/NOTIFY
+		// this should be a few hundred ms at most. With 5s polling it
+		// would always exceed 1s.
+		elapsed := time.Since(addedAt)
+		if elapsed > 2*time.Second {
+			t.Fatalf("expected LISTEN-driven wakeup under 2s; took %s (likely polling fallback)", elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker was not called within 3s; enqueuer was not woken")
+	}
+
+	// One-shot row should be gone.
+	_, err = client.PeriodicJobGet(ctx, "matrix-listen")
+	require.ErrorIs(t, err, rivertype.ErrNotFound)
+}
+
+// matrixPeriodicArgsWorker is a worker variant for the LISTEN test that
+// records the wall-clock time at which the job was invoked.
+type matrixPeriodicArgsWorker struct {
+	river.WorkerDefaults[matrixPeriodicArgs]
+	when chan time.Time
+}
+
+func (w *matrixPeriodicArgsWorker) Work(ctx context.Context, job *river.Job[matrixPeriodicArgs]) error {
+	select {
+	case w.when <- time.Now():
+	default:
+	}
+	return nil
+}
+
 var _ riverpilot.Pilot = (*proPilot[pgx.Tx])(nil)
