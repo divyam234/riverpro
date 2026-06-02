@@ -215,6 +215,54 @@ func exerciseProducers[TTx any](ctx context.Context, t *testing.T,
 		require.NoError(t, exec.ProducerDelete(ctx, &driver.ProducerDeleteParams{ID: producer.ID, Schema: schema}))
 		requireRowCount(ctx, t, exec, schema, "river_producer", 0)
 	})
+
+	t.Run("ProducerDeleteStale", func(t *testing.T) {
+		t.Parallel()
+		exec, schema := execSchema(ctx, t, executorWithTx)
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		stale := now.Add(-2 * time.Hour)
+
+		fresh, err := exec.ProducerInsertOrUpdate(ctx, &driver.ProducerInsertOrUpdateParams{ClientID: "client-fresh", CreatedAt: &now, MaxWorkers: 4, QueueName: "q1", Schema: schema, UpdatedAt: &now})
+		require.NoError(t, err)
+		_, err = exec.ProducerInsertOrUpdate(ctx, &driver.ProducerInsertOrUpdateParams{ClientID: "client-stale-q1", CreatedAt: &stale, MaxWorkers: 4, QueueName: "q1", Schema: schema, UpdatedAt: &stale})
+		require.NoError(t, err)
+		_, err = exec.ProducerInsertOrUpdate(ctx, &driver.ProducerInsertOrUpdateParams{ClientID: "client-stale-q2", CreatedAt: &stale, MaxWorkers: 4, QueueName: "q2", Schema: schema, UpdatedAt: &stale})
+		require.NoError(t, err)
+		requireRowCount(ctx, t, exec, schema, "river_producer", 3)
+
+		// Default horizon reaps the two stale rows, keeps the fresh one.
+		deleted, err := exec.ProducerDeleteStale(ctx, &driver.ProducerDeleteStaleParams{Schema: schema, StaleUpdatedAtHorizon: now.Add(-time.Hour), Max: 100})
+		require.NoError(t, err)
+		require.Equal(t, 2, deleted)
+		requireRowCount(ctx, t, exec, schema, "river_producer", 1)
+
+		// Reap across queues scoped to a single queue.
+		_, err = exec.ProducerInsertOrUpdate(ctx, &driver.ProducerInsertOrUpdateParams{ClientID: "client-stale-q1b", CreatedAt: &stale, MaxWorkers: 4, QueueName: "q1", Schema: schema, UpdatedAt: &stale})
+		require.NoError(t, err)
+		_, err = exec.ProducerInsertOrUpdate(ctx, &driver.ProducerInsertOrUpdateParams{ClientID: "client-stale-q2b", CreatedAt: &stale, MaxWorkers: 4, QueueName: "q2", Schema: schema, UpdatedAt: &stale})
+		require.NoError(t, err)
+		requireRowCount(ctx, t, exec, schema, "river_producer", 3)
+		deleted, err = exec.ProducerDeleteStale(ctx, &driver.ProducerDeleteStaleParams{Schema: schema, StaleUpdatedAtHorizon: now.Add(-time.Hour), Max: 100, QueueName: "q1"})
+		require.NoError(t, err)
+		require.Equal(t, 1, deleted)
+		requireRowCount(ctx, t, exec, schema, "river_producer", 2)
+
+		// Fresh row survives any reap.
+		survivor, err := exec.ProducerGetByID(ctx, &driver.ProducerGetByIDParams{ID: fresh.ID, Schema: schema})
+		require.NoError(t, err)
+		require.Equal(t, fresh.ClientID, survivor.ClientID)
+
+		// Max bounds the batch.
+		_, err = exec.ProducerInsertOrUpdate(ctx, &driver.ProducerInsertOrUpdateParams{ClientID: "client-stale-q3a", CreatedAt: &stale, MaxWorkers: 4, QueueName: "q3", Schema: schema, UpdatedAt: &stale})
+		require.NoError(t, err)
+		_, err = exec.ProducerInsertOrUpdate(ctx, &driver.ProducerInsertOrUpdateParams{ClientID: "client-stale-q3b", CreatedAt: &stale, MaxWorkers: 4, QueueName: "q3", Schema: schema, UpdatedAt: &stale})
+		require.NoError(t, err)
+		requireRowCount(ctx, t, exec, schema, "river_producer", 4)
+		deleted, err = exec.ProducerDeleteStale(ctx, &driver.ProducerDeleteStaleParams{Schema: schema, StaleUpdatedAtHorizon: now.Add(-time.Hour), Max: 1})
+		require.NoError(t, err)
+		require.Equal(t, 1, deleted)
+		requireRowCount(ctx, t, exec, schema, "river_producer", 3)
+	})
 }
 
 func exerciseSequences[TTx any](ctx context.Context, t *testing.T,

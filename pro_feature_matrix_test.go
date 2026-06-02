@@ -235,4 +235,73 @@ func waitMatrix(t *testing.T, pred func() bool) {
 	t.Fatal("condition not met")
 }
 
+func TestProFeatureMatrix_GracefulShutdownDeletesProducer(t *testing.T) {
+	ctx := context.Background()
+	workers := river.NewWorkers()
+	river.AddWorker(workers, river.WorkFunc(func(ctx context.Context, job *river.Job[matrixNoopArgs]) error { return nil }))
+	client, drv, schema := newMatrixClient(t, ctx, &Config{
+		Config: river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
+	})
+
+	require.NoError(t, client.Start(ctx))
+	clientID := client.Client.ID()
+
+	waitMatrix(t, func() bool {
+		rows, err := drv.GetProExecutor().ProducerListByQueue(ctx, &prodriver.ProducerListByQueueParams{QueueName: river.QueueDefault, Schema: schema})
+		if err != nil || len(rows) == 0 {
+			return false
+		}
+		return rows[0].Producer != nil && rows[0].Producer.ClientID == clientID
+	})
+
+	rows, err := drv.GetProExecutor().ProducerListByQueue(ctx, &prodriver.ProducerListByQueueParams{QueueName: river.QueueDefault, Schema: schema})
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "producer row should exist while client is running")
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, client.Stop(stopCtx))
+
+	waitMatrix(t, func() bool {
+		rows, err := drv.GetProExecutor().ProducerListByQueue(ctx, &prodriver.ProducerListByQueueParams{QueueName: river.QueueDefault, Schema: schema})
+		if err != nil {
+			return false
+		}
+		return len(rows) == 0
+	})
+}
+
+func TestProFeatureMatrix_CrashedClientLeavesStaleProducerAndReaperCleansIt(t *testing.T) {
+	ctx := context.Background()
+	workers := river.NewWorkers()
+	river.AddWorker(workers, river.WorkFunc(func(ctx context.Context, job *river.Job[matrixNoopArgs]) error { return nil }))
+	client, drv, schema := newMatrixClient(t, ctx, &Config{
+		ProducerRetentionEnabled:     true,
+		ProducerRetentionInterval:    50 * time.Millisecond,
+		ProducerStaleRetentionPeriod: time.Second,
+		Config:                      river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
+	})
+
+	stale := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	_, err := drv.GetProExecutor().ProducerInsertOrUpdate(ctx, &prodriver.ProducerInsertOrUpdateParams{
+		ClientID: "crashed-client", CreatedAt: &stale, MaxWorkers: 1, QueueName: river.QueueDefault, Schema: schema, UpdatedAt: &stale,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, client.Start(ctx))
+	t.Cleanup(func() { _ = client.Stop(context.Background()) })
+
+	waitMatrix(t, func() bool {
+		rows, err := drv.GetProExecutor().ProducerListByQueue(ctx, &prodriver.ProducerListByQueueParams{QueueName: river.QueueDefault, Schema: schema})
+		if err != nil {
+			return false
+		}
+		return len(rows) == 0
+	})
+}
+
+type matrixNoopArgs struct{}
+
+func (matrixNoopArgs) Kind() string { return "matrix_noop" }
+
 var _ riverpilot.Pilot = (*proPilot[pgx.Tx])(nil)

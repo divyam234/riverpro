@@ -72,6 +72,7 @@ type ProExecutor interface {
 	PeriodicJobKeepAliveAndReap(ctx context.Context, params *PeriodicJobKeepAliveAndReapParams) ([]*PeriodicJob, error)
 	PeriodicJobUpsertMany(ctx context.Context, params *PeriodicJobUpsertManyParams) ([]*PeriodicJob, error)
 	ProducerDelete(ctx context.Context, params *ProducerDeleteParams) error
+	ProducerDeleteStale(ctx context.Context, params *ProducerDeleteStaleParams) (int, error)
 	ProducerGetByID(ctx context.Context, params *ProducerGetByIDParams) (*Producer, error)
 	QueueGetMetadataForInsert(ctx context.Context, params *QueueGetMetadataForInsertParams) ([]*QueueGetMetadataForInsertResult, error)
 	ProducerInsertOrUpdate(ctx context.Context, params *ProducerInsertOrUpdateParams) (*Producer, error)
@@ -306,6 +307,14 @@ type Producer struct {
 type ProducerDeleteParams struct {
 	ID     int64
 	Schema string
+}
+
+// ProducerDeleteStaleParams
+type ProducerDeleteStaleParams struct {
+	Max                   int
+	QueueName             string
+	Schema                string
+	StaleUpdatedAtHorizon time.Time
 }
 
 // ProducerGetByIDParams
@@ -2149,6 +2158,70 @@ func (e *Executor) ProducerDelete(ctx context.Context, params *ProducerDeletePar
 	defer compat.Unlock()
 	delete(compat.producers[params.Schema], params.ID)
 	return nil
+}
+func (e *Executor) ProducerDeleteStale(ctx context.Context, params *ProducerDeleteStaleParams) (int, error) {
+	if params == nil {
+		return 0, nil
+	}
+	schema := params.Schema
+	max := limitDefault(params.Max, 100)
+	if dbAvailable(e) {
+		out, err := scanJSON[int](ctx, e.Executor, fmt.Sprintf(`
+			WITH candidates AS (
+				SELECT id
+				FROM %s
+				WHERE updated_at < $1
+				  AND ($2 = '' OR queue_name = $2)
+				ORDER BY updated_at ASC, id ASC
+				LIMIT $3
+			), deleted AS (
+				DELETE FROM %s AS p
+				USING candidates
+				WHERE p.id = candidates.id
+				RETURNING 1
+			)
+			SELECT count(*)::int FROM deleted
+		`, qt(schema, "river_producer"), qt(schema, "river_producer")), params.StaleUpdatedAtHorizon, params.QueueName, max)
+		if err != nil {
+			return 0, err
+		}
+		return out, nil
+	}
+	compat.Lock()
+	defer compat.Unlock()
+	if compat.producers[schema] == nil {
+		return 0, nil
+	}
+	type row struct {
+		updatedAt time.Time
+		id        int64
+	}
+	matches := make([]row, 0, len(compat.producers[schema]))
+	for id, p := range compat.producers[schema] {
+		if p == nil {
+			continue
+		}
+		if !params.StaleUpdatedAtHorizon.IsZero() && !p.UpdatedAt.Before(params.StaleUpdatedAtHorizon) {
+			continue
+		}
+		if params.QueueName != "" && p.QueueName != params.QueueName {
+			continue
+		}
+		matches = append(matches, row{updatedAt: p.UpdatedAt, id: id})
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].updatedAt.Equal(matches[j].updatedAt) {
+			return matches[i].id < matches[j].id
+		}
+		return matches[i].updatedAt.Before(matches[j].updatedAt)
+	})
+	if len(matches) > max {
+		matches = matches[:max]
+	}
+	for _, r := range matches {
+		delete(compat.producers[schema], r.id)
+	}
+	return len(matches), nil
 }
 func (e *Executor) ProducerGetByID(ctx context.Context, params *ProducerGetByIDParams) (*Producer, error) {
 	if params == nil {

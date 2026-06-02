@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/divyam234/riverpro/riverworkflow"
 )
@@ -105,6 +106,30 @@ func TestConfigWithDefaultsWorkflowAwareRetention(t *testing.T) {
 	cfg = (&Config{}).WithDefaults()
 	if cfg.WorkflowAwareRetention {
 		t.Fatal("WorkflowAwareRetention should default to false")
+	}
+}
+
+func TestConfigWithDefaultsProducerRetention(t *testing.T) {
+	cfg := (&Config{ProducerRetentionEnabled: true, ProducerStaleRetentionPeriod: 5 * time.Minute, ProducerRetentionInterval: time.Minute}).WithDefaults()
+	if !cfg.ProducerRetentionEnabled {
+		t.Fatal("ProducerRetentionEnabled should be preserved through WithDefaults")
+	}
+	if cfg.ProducerStaleRetentionPeriod != 5*time.Minute {
+		t.Fatalf("ProducerStaleRetentionPeriod should be preserved, got %s", cfg.ProducerStaleRetentionPeriod)
+	}
+	if cfg.ProducerRetentionInterval != time.Minute {
+		t.Fatalf("ProducerRetentionInterval should be preserved, got %s", cfg.ProducerRetentionInterval)
+	}
+
+	cfg = (&Config{}).WithDefaults()
+	if cfg.ProducerRetentionEnabled {
+		t.Fatal("ProducerRetentionEnabled should default to false")
+	}
+	if cfg.ProducerStaleRetentionPeriod != 30*time.Minute {
+		t.Fatalf("ProducerStaleRetentionPeriod should default to 30m, got %s", cfg.ProducerStaleRetentionPeriod)
+	}
+	if cfg.ProducerRetentionInterval != 5*time.Minute {
+		t.Fatalf("ProducerRetentionInterval should default to 5m, got %s", cfg.ProducerRetentionInterval)
 	}
 }
 

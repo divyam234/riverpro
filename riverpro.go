@@ -49,6 +49,9 @@ type Config struct {
 	DeadLetter                       DeadLetterConfig
 	DurablePeriodicJobs              DurablePeriodicJobsConfig
 	PartitionKeyCacheTTL             time.Duration
+	ProducerRetentionEnabled         bool
+	ProducerRetentionInterval        time.Duration
+	ProducerStaleRetentionPeriod     time.Duration
 	ProQueues                        map[string]QueueConfig
 	SequenceSchedulerInterval        time.Duration
 	WorkflowAwareRetention           bool
@@ -89,6 +92,12 @@ func (c *Config) WithDefaults() *Config {
 	}
 	if c.DurablePeriodicJobs.StaleThreshold == 0 {
 		c.DurablePeriodicJobs.StaleThreshold = 24 * time.Hour
+	}
+	if c.ProducerStaleRetentionPeriod == 0 {
+		c.ProducerStaleRetentionPeriod = 30 * time.Minute
+	}
+	if c.ProducerRetentionInterval == 0 {
+		c.ProducerRetentionInterval = 5 * time.Minute
 	}
 	if c.DurablePeriodicJobs.StartStaggerSpread == 0 {
 		c.DurablePeriodicJobs.StartStaggerSpread = time.Minute
@@ -216,6 +225,7 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	go c.workflowEvaluatorLoop(ctx)
 	go c.queueRetentionCleanerLoop(ctx)
 	go c.workflowRetentionCleanerLoop(ctx)
+	go c.producerRetentionCleanerLoop(ctx)
 	return nil
 }
 
@@ -283,6 +293,42 @@ func (c *Client[TTx]) workflowRetentionCleanerLoop(ctx context.Context) {
 			_ = c.cleanWorkflowRetentionOnce(ctx)
 		}
 	}
+}
+
+func (c *Client[TTx]) producerRetentionCleanerLoop(ctx context.Context) {
+	if c == nil || c.proDriver == nil || c.config == nil || !c.config.ProducerRetentionEnabled {
+		return
+	}
+	interval := c.config.ProducerRetentionInterval
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = c.cleanProducerStaleOnce(ctx)
+		}
+	}
+}
+
+func (c *Client[TTx]) cleanProducerStaleOnce(ctx context.Context) error {
+	if c == nil || c.proDriver == nil || c.config == nil || !c.config.ProducerRetentionEnabled {
+		return nil
+	}
+	if c.config.ProducerStaleRetentionPeriod <= 0 {
+		return nil
+	}
+	exec := c.proDriver.GetProExecutor()
+	_, err := exec.ProducerDeleteStale(ctx, &prodriver.ProducerDeleteStaleParams{
+		Max:                   100,
+		Schema:                c.config.Schema,
+		StaleUpdatedAtHorizon: time.Now().Add(-c.config.ProducerStaleRetentionPeriod),
+	})
+	return err
 }
 
 func (c *Client[TTx]) cleanWorkflowRetentionOnce(ctx context.Context) error {
