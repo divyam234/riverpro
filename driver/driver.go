@@ -1303,12 +1303,6 @@ var compat = struct {
 	worklists:    map[string]map[string]*WorkflowWorklistItem{},
 }
 
-func schemaKey(schema string) string {
-	if schema == "" {
-		return "public"
-	}
-	return schema
-}
 func nowUTC() time.Time { return time.Now().UTC() }
 
 func nullableTime(t time.Time) any {
@@ -1589,9 +1583,9 @@ func (e *Executor) JobGetAvailableLimited(ctx context.Context, params *JobGetAva
 	}
 	partitionExpr := jobConcurrencyPartitionKeySQL("j", params.PartitionByKind, params.PartitionByArgs)
 	runningPartitionExpr := jobConcurrencyPartitionKeySQL("r", params.PartitionByKind, params.PartitionByArgs)
-	schema := schemaKey(base.Schema)
-	jobTable := qTable(schema, "river_job")
-	jobState := qType(schema, "river_job_state")
+	schema := base.Schema
+	jobTable := qt(schema, "river_job")
+	jobState := qt(schema, "river_job_state")
 	query := fmt.Sprintf(`
 WITH available_partitions AS MATERIALIZED (
 	SELECT DISTINCT partition_key
@@ -1771,7 +1765,7 @@ func (e *Executor) JobDeadLetterDeleteByID(ctx context.Context, params *JobDeadL
 	if !dbAvailable(e) {
 		return nil, errors.New("riverpro driver: nil executor")
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	job, err := scanJSON[*rivertype.JobRow](ctx, e.Executor, fmt.Sprintf(`
 		DELETE FROM %s WHERE id = $1
 		RETURNING json_build_object(
@@ -1782,7 +1776,7 @@ func (e *Executor) JobDeadLetterDeleteByID(ctx context.Context, params *JobDeadL
 			'ScheduledAt', scheduled_at, 'State', state, 'Tags', tags,
 			'UniqueKey', encode(coalesce(unique_key, ''::bytea), 'base64'), 'UniqueStates', unique_states
 		)
-	`, qTable(schema, "river_job_dead_letter")), params.ID)
+	`, qt(schema, "river_job_dead_letter")), params.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -1792,10 +1786,10 @@ func (e *Executor) JobDeadLetterGetAll(ctx context.Context, params *JobDeadLette
 	if !dbAvailable(e) {
 		return nil, errors.New("riverpro driver: nil executor")
 	}
-	schema := schemaKey("")
+	schema := ""
 	max := 10000
 	if params != nil {
-		schema = schemaKey(params.Schema)
+		schema = params.Schema
 	}
 	return scanJSON[[]*rivertype.JobRow](ctx, e.Executor, fmt.Sprintf(`
 		SELECT coalesce(json_agg(json_build_object(
@@ -1807,7 +1801,7 @@ func (e *Executor) JobDeadLetterGetAll(ctx context.Context, params *JobDeadLette
 			'UniqueKey', encode(coalesce(unique_key, ''::bytea), 'base64'), 'UniqueStates', unique_states
 		) ORDER BY finalized_at DESC NULLS LAST, id DESC), '[]'::json)
 		FROM (SELECT * FROM %s ORDER BY finalized_at DESC NULLS LAST, id DESC LIMIT $1) dl
-	`, qTable(schema, "river_job_dead_letter")), max)
+	`, qt(schema, "river_job_dead_letter")), max)
 }
 func (e *Executor) JobDeadLetterGetByID(ctx context.Context, params *JobDeadLetterGetByIDParams) (*rivertype.JobRow, error) {
 	if params == nil {
@@ -1816,7 +1810,7 @@ func (e *Executor) JobDeadLetterGetByID(ctx context.Context, params *JobDeadLett
 	if !dbAvailable(e) {
 		return nil, errors.New("riverpro driver: nil executor")
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	return scanJSON[*rivertype.JobRow](ctx, e.Executor, fmt.Sprintf(`
 		SELECT json_build_object(
 			'ID', id, 'Attempt', attempt, 'AttemptedAt', attempted_at, 'AttemptedBy', attempted_by,
@@ -1827,7 +1821,7 @@ func (e *Executor) JobDeadLetterGetByID(ctx context.Context, params *JobDeadLett
 			'UniqueKey', encode(coalesce(unique_key, ''::bytea), 'base64'), 'UniqueStates', unique_states
 		)
 		FROM %s WHERE id = $1
-	`, qTable(schema, "river_job_dead_letter")), params.ID)
+	`, qt(schema, "river_job_dead_letter")), params.ID)
 }
 func (e *Executor) JobDeadLetterMoveByID(ctx context.Context, params *JobDeadLetterMoveByIDParams) (*rivertype.JobRow, error) {
 	if params == nil {
@@ -1836,7 +1830,7 @@ func (e *Executor) JobDeadLetterMoveByID(ctx context.Context, params *JobDeadLet
 	if !dbAvailable(e) {
 		return nil, errors.New("riverpro driver: nil executor")
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	now := nowUTC()
 	id, err := scanJSON[int64](ctx, e.Executor, fmt.Sprintf(`
 		WITH moved AS (
@@ -1849,7 +1843,7 @@ func (e *Executor) JobDeadLetterMoveByID(ctx context.Context, params *JobDeadLet
 			RETURNING id
 		)
 		SELECT to_json(id) FROM upserted
-	`, qTable(schema, "river_job_dead_letter"), qTable(schema, "river_job"), qType(schema, "river_job_state"), qType(schema, "river_job_state")), params.ID, now)
+	`, qt(schema, "river_job_dead_letter"), qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job_state")), params.ID, now)
 	if err != nil {
 		return nil, err
 	}
@@ -1885,10 +1879,10 @@ func (e *Executor) JobGetAvailableForBatch(ctx context.Context, params *JobGetAv
 	if params == nil || params.Max <= 0 {
 		return []*rivertype.JobRow{}, nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	batchKey := params.BatchKey
 	if batchKey == "" && params.BatchLeaderJobID != 0 {
-		_ = e.Executor.QueryRow(ctx, fmt.Sprintf(`SELECT metadata->>'riverpro_batch_key' FROM %s WHERE id = $1`, qTable(schema, "river_job")), params.BatchLeaderJobID).Scan(&batchKey)
+		_ = e.Executor.QueryRow(ctx, fmt.Sprintf(`SELECT metadata->>'riverpro_batch_key' FROM %s WHERE id = $1`, qt(schema, "river_job")), params.BatchLeaderJobID).Scan(&batchKey)
 	}
 	if batchKey == "" {
 		return []*rivertype.JobRow{}, nil
@@ -1917,7 +1911,7 @@ func (e *Executor) JobGetAvailableForBatch(ctx context.Context, params *JobGetAv
 			RETURNING j.*
 		)
 		SELECT coalesce(json_agg(%s ORDER BY j.priority ASC, j.scheduled_at ASC, j.id ASC), '[]'::json) FROM updated AS j
-	`, qTable(schema, "river_job"), qType(schema, "river_job_state"), qTable(schema, "river_job"), qType(schema, "river_job_state"), jobRowJSONObjectSQL("j")), params.Queue, params.Kind, batchKey, params.BatchLeaderJobID, now, int(params.Max), params.AttemptedBy)
+	`, qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job"), qt(schema, "river_job_state"), jobRowJSONObjectSQL("j")), params.Queue, params.Kind, batchKey, params.BatchLeaderJobID, now, int(params.Max), params.AttemptedBy)
 }
 func (e *Executor) JobGetAvailablePartitionKeys(ctx context.Context, params *JobGetAvailablePartitionKeysParams) ([]string, error) {
 	if e == nil || e.Executor == nil {
@@ -1945,11 +1939,11 @@ func (e *Executor) JobGetAvailablePartitionKeys(ctx context.Context, params *Job
 // ---- Periodic jobs/producers/sequences -------------------------------------------------------
 
 func (e *Executor) PeriodicJobGetAll(ctx context.Context, params *PeriodicJobGetAllParams) ([]*PeriodicJob, error) {
-	schema := schemaKey("")
+	schema := ""
 	max := 10000
 	var stale time.Time
 	if params != nil {
-		schema = schemaKey(params.Schema)
+		schema = params.Schema
 		max = limitDefault(params.Max, max)
 		stale = params.StaleUpdatedAtHorizon
 	}
@@ -1974,7 +1968,7 @@ func (e *Executor) PeriodicJobGetAll(ctx context.Context, params *PeriodicJobGet
 				ORDER BY id
 				LIMIT $1
 			) p
-		`, qTable(schema, "river_periodic_job"), where), args...)
+		`, qt(schema, "river_periodic_job"), where), args...)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -2000,11 +1994,11 @@ func (e *Executor) PeriodicJobGetByID(ctx context.Context, params *PeriodicJobGe
 			SELECT json_build_object('ID', id, 'CreatedAt', created_at, 'NextRunAt', next_run_at, 'UpdatedAt', updated_at)
 			FROM %s
 			WHERE id = $1
-		`, qTable(schemaKey(params.Schema), "river_periodic_job")), params.ID)
+		`, qt(params.Schema, "river_periodic_job")), params.ID)
 	}
 	compat.Lock()
 	defer compat.Unlock()
-	if p := compat.periodic[schemaKey(params.Schema)][params.ID]; p != nil {
+	if p := compat.periodic[params.Schema][params.ID]; p != nil {
 		c := *p
 		return &c, nil
 	}
@@ -2014,7 +2008,7 @@ func (e *Executor) PeriodicJobInsert(ctx context.Context, params *PeriodicJobIns
 	if params == nil {
 		return nil, errors.New("riverpro driver: nil params")
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	now := nowUTC()
 	if params.UpdatedAt != nil {
 		now = *params.UpdatedAt
@@ -2025,7 +2019,7 @@ func (e *Executor) PeriodicJobInsert(ctx context.Context, params *PeriodicJobIns
 			VALUES ($1, $2, $3)
 			ON CONFLICT (id) DO UPDATE SET next_run_at = excluded.next_run_at, updated_at = excluded.updated_at
 			RETURNING json_build_object('ID', id, 'CreatedAt', created_at, 'NextRunAt', next_run_at, 'UpdatedAt', updated_at)
-		`, qTable(schema, "river_periodic_job")), params.ID, params.NextRunAt, now)
+		`, qt(schema, "river_periodic_job")), params.ID, params.NextRunAt, now)
 	}
 	job := &PeriodicJob{ID: params.ID, CreatedAt: nowUTC(), NextRunAt: params.NextRunAt, UpdatedAt: now}
 	compat.Lock()
@@ -2041,14 +2035,14 @@ func (e *Executor) PeriodicJobKeepAliveAndReap(ctx context.Context, params *Peri
 	if params == nil {
 		return []*PeriodicJob{}, nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	now := nowUTC()
 	if params.Now != nil {
 		now = *params.Now
 	}
 	if dbAvailable(e) {
 		if len(params.ID) > 0 {
-			if err := e.Executor.Exec(ctx, fmt.Sprintf(`UPDATE %s SET updated_at = $1 WHERE id = ANY($2::text[])`, qTable(schema, "river_periodic_job")), now, params.ID); err != nil {
+			if err := e.Executor.Exec(ctx, fmt.Sprintf(`UPDATE %s SET updated_at = $1 WHERE id = ANY($2::text[])`, qt(schema, "river_periodic_job")), now, params.ID); err != nil {
 				return nil, err
 			}
 		}
@@ -2060,7 +2054,7 @@ func (e *Executor) PeriodicJobKeepAliveAndReap(ctx context.Context, params *Peri
 			)
 			SELECT coalesce(json_agg(json_build_object('ID', id, 'CreatedAt', created_at, 'NextRunAt', next_run_at, 'UpdatedAt', updated_at) ORDER BY id), '[]'::json)
 			FROM deleted
-		`, qTable(schema, "river_periodic_job")), params.ID, params.StaleUpdatedAtHorizon)
+		`, qt(schema, "river_periodic_job")), params.ID, params.StaleUpdatedAtHorizon)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -2088,7 +2082,7 @@ func (e *Executor) PeriodicJobUpsertMany(ctx context.Context, params *PeriodicJo
 	if params == nil {
 		return []*PeriodicJob{}, nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		out := make([]*PeriodicJob, 0, len(params.Jobs))
 		for _, p := range params.Jobs {
@@ -2130,11 +2124,11 @@ func (e *Executor) ProducerDelete(ctx context.Context, params *ProducerDeletePar
 		return nil
 	}
 	if dbAvailable(e) {
-		return e.Executor.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE id = $1`, qTable(schemaKey(params.Schema), "river_producer")), params.ID)
+		return e.Executor.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE id = $1`, qt(params.Schema, "river_producer")), params.ID)
 	}
 	compat.Lock()
 	defer compat.Unlock()
-	delete(compat.producers[schemaKey(params.Schema)], params.ID)
+	delete(compat.producers[params.Schema], params.ID)
 	return nil
 }
 func (e *Executor) ProducerGetByID(ctx context.Context, params *ProducerGetByIDParams) (*Producer, error) {
@@ -2145,11 +2139,11 @@ func (e *Executor) ProducerGetByID(ctx context.Context, params *ProducerGetByIDP
 		return scanJSON[*Producer](ctx, e.Executor, fmt.Sprintf(`
 			SELECT json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(metadata::text::bytea, 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
 			FROM %s WHERE id = $1
-		`, qTable(schemaKey(params.Schema), "river_producer")), params.ID)
+		`, qt(params.Schema, "river_producer")), params.ID)
 	}
 	compat.Lock()
 	defer compat.Unlock()
-	if p := compat.producers[schemaKey(params.Schema)][params.ID]; p != nil {
+	if p := compat.producers[params.Schema][params.ID]; p != nil {
 		c := *p
 		c.Metadata = append([]byte(nil), p.Metadata...)
 		return &c, nil
@@ -2170,7 +2164,7 @@ func (e *Executor) ProducerInsertOrUpdate(ctx context.Context, params *ProducerI
 	if params == nil {
 		return nil, errors.New("riverpro driver: nil params")
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	now := nowUTC()
 	if params.UpdatedAt != nil {
 		now = *params.UpdatedAt
@@ -2189,14 +2183,14 @@ func (e *Executor) ProducerInsertOrUpdate(ctx context.Context, params *ProducerI
 				VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
 				ON CONFLICT (id) DO UPDATE SET client_id = excluded.client_id, queue_name = excluded.queue_name, max_workers = excluded.max_workers, metadata = excluded.metadata, paused_at = excluded.paused_at, updated_at = excluded.updated_at
 				RETURNING json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(metadata::text::bytea, 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
-			`, qTable(schema, "river_producer")), params.ID, params.ClientID, params.QueueName, params.MaxWorkers, string(params.Metadata), params.PausedAt, created, now)
+			`, qt(schema, "river_producer")), params.ID, params.ClientID, params.QueueName, params.MaxWorkers, string(params.Metadata), params.PausedAt, created, now)
 		}
 		return scanJSON[*Producer](ctx, e.Executor, fmt.Sprintf(`
 			INSERT INTO %s (client_id, queue_name, max_workers, metadata, paused_at, created_at, updated_at)
 			VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
 			ON CONFLICT (client_id, queue_name) DO UPDATE SET max_workers = excluded.max_workers, metadata = excluded.metadata, paused_at = excluded.paused_at, updated_at = excluded.updated_at
 			RETURNING json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(metadata::text::bytea, 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
-		`, qTable(schema, "river_producer")), params.ClientID, params.QueueName, params.MaxWorkers, string(params.Metadata), params.PausedAt, created, now)
+		`, qt(schema, "river_producer")), params.ClientID, params.QueueName, params.MaxWorkers, string(params.Metadata), params.PausedAt, created, now)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -2232,7 +2226,7 @@ func (e *Executor) ProducerKeepAlive(ctx context.Context, params *ProducerKeepAl
 		return scanJSON[*Producer](ctx, e.Executor, fmt.Sprintf(`
 			UPDATE %s SET updated_at = $1 WHERE id = $2
 			RETURNING json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(metadata::text::bytea, 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
-		`, qTable(schemaKey(params.Schema), "river_producer")), now, params.ID)
+		`, qt(params.Schema, "river_producer")), now, params.ID)
 	}
 	return e.ProducerUpdate(ctx, &ProducerUpdateParams{ID: params.ID, Schema: params.Schema, UpdatedAt: ptrTime(nowUTC())})
 }
@@ -2240,30 +2234,16 @@ func ptrTime(t time.Time) *time.Time { return &t }
 
 func dbAvailable(e *Executor) bool { return e != nil && e.Executor != nil }
 
-func safeIdentifier(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' || (i > 0 && r >= '0' && r <= '9') {
-			continue
-		}
-		return false
-	}
-	return true
+func quoteIdentifier(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
-func qTable(schema, table string) string {
-	if schema == "" {
-		schema = "public"
+func qt(schema, table string) string {
+	if schema != "" {
+		return quoteIdentifier(schema) + "." + quoteIdentifier(table)
 	}
-	if !safeIdentifier(schema) || !safeIdentifier(table) {
-		panic("riverpro driver: unsafe SQL identifier")
-	}
-	return fmt.Sprintf("%q.%q", schema, table)
+	return quoteIdentifier(table)
 }
-
-func qType(schema, typ string) string { return qTable(schema, typ) }
 
 func scanJSON[T any](ctx context.Context, exec riverdriver.Executor, query string, args ...any) (T, error) {
 	var zero T
@@ -2366,10 +2346,10 @@ func interpretDBError(err error) error {
 	return err
 }
 func (e *Executor) ProducerListByQueue(ctx context.Context, params *ProducerListByQueueParams) ([]*ProducerListByQueueResult, error) {
-	schema := schemaKey("")
+	schema := ""
 	q := ""
 	if params != nil {
-		schema = schemaKey(params.Schema)
+		schema = params.Schema
 		q = params.QueueName
 	}
 	if dbAvailable(e) {
@@ -2377,7 +2357,7 @@ func (e *Executor) ProducerListByQueue(ctx context.Context, params *ProducerList
 			SELECT coalesce(json_agg(json_build_object('Producer', json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(metadata::text::bytea, 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at), 'Running', 0) ORDER BY id), '[]'::json)
 			FROM %s
 			WHERE ($1 = '' OR queue_name = $1)
-		`, qTable(schema, "river_producer")), q)
+		`, qt(schema, "river_producer")), q)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -2409,11 +2389,11 @@ func (e *Executor) ProducerUpdate(ctx context.Context, params *ProducerUpdatePar
 				updated_at = $8
 			WHERE id = $1
 			RETURNING json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(metadata::text::bytea, 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
-		`, qTable(schemaKey(params.Schema), "river_producer")), params.ID, params.MaxWorkersDoUpdate, params.MaxWorkers, params.MetadataDoUpdate, string(params.Metadata), params.PausedAtDoUpdate, params.PausedAt, now)
+		`, qt(params.Schema, "river_producer")), params.ID, params.MaxWorkersDoUpdate, params.MaxWorkers, params.MetadataDoUpdate, string(params.Metadata), params.PausedAtDoUpdate, params.PausedAt, now)
 	}
 	compat.Lock()
 	defer compat.Unlock()
-	p := compat.producers[schemaKey(params.Schema)][params.ID]
+	p := compat.producers[params.Schema][params.ID]
 	if p == nil {
 		return nil, rivertype.ErrNotFound
 	}
@@ -2439,7 +2419,7 @@ func (e *Executor) SequenceAppendMany(ctx context.Context, params *SequenceAppen
 	if params == nil {
 		return 0, nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		return scanJSON[int](ctx, e.Executor, fmt.Sprintf(`
 			WITH keys AS (
@@ -2451,7 +2431,7 @@ func (e *Executor) SequenceAppendMany(ctx context.Context, params *SequenceAppen
 				RETURNING id
 			)
 			SELECT to_json(count(*)::int) FROM inserted
-		`, qTable(schema, "river_job_sequence")), params.SeqKeys)
+		`, qt(schema, "river_job_sequence")), params.SeqKeys)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -2472,17 +2452,17 @@ func (e *Executor) SequenceAppendMany(ctx context.Context, params *SequenceAppen
 	return n, nil
 }
 func (e *Executor) SequenceList(ctx context.Context, params *SequenceListParams) ([]*Sequence, error) {
-	schema := schemaKey("")
+	schema := ""
 	max := 10000
 	if params != nil {
-		schema = schemaKey(params.Schema)
+		schema = params.Schema
 		max = limitDefault(params.MaxCount, max)
 	}
 	if dbAvailable(e) {
 		return scanJSON[[]*Sequence](ctx, e.Executor, fmt.Sprintf(`
 			SELECT coalesce(json_agg(json_build_object('ID', id, 'Key', key, 'CreatedAt', created_at) ORDER BY key), '[]'::json)
 			FROM (SELECT id, key, created_at FROM %s ORDER BY key LIMIT $1) s
-		`, qTable(schema, "river_job_sequence")), max)
+		`, qt(schema, "river_job_sequence")), max)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -2503,7 +2483,7 @@ func (e *Executor) SequencePromote(ctx context.Context, params *SequencePromoteP
 		return res, nil
 	}
 	if dbAvailable(e) {
-		schema := schemaKey(params.Schema)
+		schema := params.Schema
 		now := nowUTC()
 		if params.Now != nil {
 			now = *params.Now
@@ -2512,7 +2492,7 @@ func (e *Executor) SequencePromote(ctx context.Context, params *SequencePromoteP
 			SELECT coalesce(json_agg(key ORDER BY key), '[]'::json)
 			FROM %s
 			WHERE key = ANY($1::text[])
-		`, qTable(schema, "river_job_sequence")), params.Keys)
+		`, qt(schema, "river_job_sequence")), params.Keys)
 		if err != nil {
 			return nil, err
 		}
@@ -2541,7 +2521,7 @@ func (e *Executor) SequencePromote(ctx context.Context, params *SequencePromoteP
 					RETURNING j.id
 				)
 				SELECT coalesce((SELECT id FROM promoted), 0)
-			`, qTable(schema, "river_job"), qType(schema, "river_job_state"), qTable(schema, "river_job"), qType(schema, "river_job_state"), qType(schema, "river_job_state")), k, now).Scan(&promotedID)
+			`, qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job_state")), k, now).Scan(&promotedID)
 			if err != nil {
 				return nil, err
 			}
@@ -2612,7 +2592,7 @@ func (e *Executor) WorkflowAttemptInsert(ctx context.Context, params *WorkflowAt
 	if params == nil {
 		return nil, errors.New("riverpro driver: nil params")
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		triggered := string(params.TriggeredBy)
 		if triggered == "" {
@@ -2623,7 +2603,7 @@ func (e *Executor) WorkflowAttemptInsert(ctx context.Context, params *WorkflowAt
 			VALUES ($1, $2, $3, $4, $5::jsonb)
 			ON CONFLICT (workflow_id, attempt) DO UPDATE SET reset_history = excluded.reset_history, retry_mode = excluded.retry_mode, triggered_by = excluded.triggered_by
 			RETURNING json_build_object('WorkflowID', workflow_id, 'Attempt', attempt, 'ResetHistory', reset_history, 'RetryMode', retry_mode, 'TriggeredBy', encode(triggered_by::text::bytea, 'base64'), 'CreatedAt', created_at)
-		`, qTable(schema, "river_workflow_attempt")), params.WorkflowID, params.Attempt, params.ResetHistory, params.RetryMode, triggered)
+		`, qt(schema, "river_workflow_attempt")), params.WorkflowID, params.Attempt, params.ResetHistory, params.RetryMode, triggered)
 	}
 	a := &WorkflowAttempt{Attempt: params.Attempt, CreatedAt: nowUTC(), ResetHistory: params.ResetHistory, RetryMode: params.RetryMode, TriggeredBy: append([]byte(nil), params.TriggeredBy...), WorkflowID: params.WorkflowID}
 	compat.Lock()
@@ -2640,12 +2620,12 @@ func (e *Executor) WorkflowAttemptListByWorkflowID(ctx context.Context, params *
 	if params == nil {
 		return []*WorkflowAttempt{}, nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		return scanJSON[[]*WorkflowAttempt](ctx, e.Executor, fmt.Sprintf(`
 			SELECT coalesce(json_agg(json_build_object('WorkflowID', workflow_id, 'Attempt', attempt, 'ResetHistory', reset_history, 'RetryMode', retry_mode, 'TriggeredBy', encode(triggered_by::text::bytea, 'base64'), 'CreatedAt', created_at) ORDER BY attempt), '[]'::json)
 			FROM %s WHERE workflow_id = $1
-		`, qTable(schema, "river_workflow_attempt")), params.WorkflowID)
+		`, qt(schema, "river_workflow_attempt")), params.WorkflowID)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -2662,7 +2642,7 @@ func (e *Executor) WorkflowAttemptTaskInsert(ctx context.Context, params *Workfl
 	if params == nil {
 		return nil, errors.New("riverpro driver: nil params")
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		meta := string(params.Metadata)
 		if meta == "" {
@@ -2673,7 +2653,7 @@ func (e *Executor) WorkflowAttemptTaskInsert(ctx context.Context, params *Workfl
 			VALUES ($1, $2, $3, $4, $5::%s, $6, $7::jsonb, $8)
 			ON CONFLICT (workflow_id, attempt, task) DO UPDATE SET job_id = excluded.job_id, state = excluded.state, attempt_count = excluded.attempt_count, metadata = excluded.metadata, finalized_at = excluded.finalized_at
 			RETURNING json_build_object('WorkflowID', workflow_id, 'Attempt', attempt, 'Task', task, 'JobID', job_id, 'State', state, 'AttemptCount', attempt_count, 'Metadata', encode(metadata::text::bytea, 'base64'), 'FinalizedAt', finalized_at, 'Errors', errors)
-		`, qTable(schema, "river_workflow_attempt_task"), qType(schema, "river_job_state")), params.WorkflowID, params.Attempt, params.Task, params.JobID, params.State, params.AttemptCount, meta, params.FinalizedAt)
+		`, qt(schema, "river_workflow_attempt_task"), qt(schema, "river_job_state")), params.WorkflowID, params.Attempt, params.Task, params.JobID, params.State, params.AttemptCount, meta, params.FinalizedAt)
 	}
 	at := &WorkflowAttemptTask{Attempt: params.Attempt, AttemptCount: params.AttemptCount, FinalizedAt: params.FinalizedAt, JobID: params.JobID, Metadata: append([]byte(nil), params.Metadata...), State: params.State, Task: params.Task, WorkflowID: params.WorkflowID}
 	compat.Lock()
@@ -2690,12 +2670,12 @@ func (e *Executor) WorkflowAttemptTaskListByWorkflowID(ctx context.Context, para
 	if params == nil {
 		return []*WorkflowAttemptTask{}, nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		return scanJSON[[]*WorkflowAttemptTask](ctx, e.Executor, fmt.Sprintf(`
 			SELECT coalesce(json_agg(json_build_object('WorkflowID', workflow_id, 'Attempt', attempt, 'Task', task, 'JobID', job_id, 'State', state, 'AttemptCount', attempt_count, 'Metadata', encode(metadata::text::bytea, 'base64'), 'FinalizedAt', finalized_at, 'Errors', errors) ORDER BY task), '[]'::json)
 			FROM %s WHERE workflow_id = $1 AND ($2::int = 0 OR attempt = $2)
-		`, qTable(schema, "river_workflow_attempt_task")), params.WorkflowID, params.Attempt)
+		`, qt(schema, "river_workflow_attempt_task")), params.WorkflowID, params.Attempt)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -2732,13 +2712,13 @@ func (e *Executor) WorkflowCancel(ctx context.Context, params *WorkflowCancelPar
 		}
 	}
 	if dbAvailable(e) {
-		err := e.Executor.Exec(ctx, fmt.Sprintf(`UPDATE %s SET state = 'cancelled', finalized_at = $2, updated_at = $2 WHERE id = $1`, qTable(schemaKey(params.Schema), "river_workflow")), params.WorkflowID, now)
+		err := e.Executor.Exec(ctx, fmt.Sprintf(`UPDATE %s SET state = 'cancelled', finalized_at = $2, updated_at = $2 WHERE id = $1`, qt(params.Schema, "river_workflow")), params.WorkflowID, now)
 		if err != nil {
 			return out, err
 		}
 	} else {
 		compat.Lock()
-		if w := compat.workflows[schemaKey(params.Schema)][params.WorkflowID]; w != nil {
+		if w := compat.workflows[params.Schema][params.WorkflowID]; w != nil {
 			w.State = "cancelled"
 			w.FinalizedAt = &now
 			w.UpdatedAt = now
@@ -2782,7 +2762,7 @@ func (e *Executor) WorkflowCleanupDeleteAttemptsByWorkflowIDs(ctx context.Contex
 	}
 	compat.Lock()
 	defer compat.Unlock()
-	m := compat.attempts[schemaKey(params.Schema)]
+	m := compat.attempts[params.Schema]
 	for _, id := range params.WorkflowIDs {
 		delete(m, id)
 	}
@@ -2795,7 +2775,7 @@ func (e *Executor) WorkflowCleanupDeleteAttemptTasksByWorkflowIDs(ctx context.Co
 	}
 	compat.Lock()
 	defer compat.Unlock()
-	m := compat.attemptTasks[schemaKey(params.Schema)]
+	m := compat.attemptTasks[params.Schema]
 	for _, id := range params.WorkflowIDs {
 		delete(m, id)
 	}
@@ -2828,7 +2808,7 @@ func (e *Executor) WorkflowCleanupDeleteSignalsByWorkflowIDs(ctx context.Context
 	}
 	compat.Lock()
 	defer compat.Unlock()
-	m := compat.signals[schemaKey(params.Schema)]
+	m := compat.signals[params.Schema]
 	for _, id := range params.WorkflowIDs {
 		delete(m, id)
 	}
@@ -2847,7 +2827,7 @@ func (e *Executor) WorkflowCleanupDeleteWorkflowsByWorkflowIDs(ctx context.Conte
 	}
 	compat.Lock()
 	defer compat.Unlock()
-	m := compat.workflows[schemaKey(params.Schema)]
+	m := compat.workflows[params.Schema]
 	for _, id := range params.WorkflowIDs {
 		delete(m, id)
 	}
@@ -2860,19 +2840,19 @@ func (e *Executor) WorkflowCleanupDeleteWorklistByWorkflowIDs(ctx context.Contex
 	}
 	compat.Lock()
 	defer compat.Unlock()
-	m := compat.worklists[schemaKey(params.Schema)]
+	m := compat.worklists[params.Schema]
 	for _, id := range params.WorkflowIDs {
 		delete(m, id)
 	}
 	return nil
 }
 func (e *Executor) WorkflowCleanupListFinalizedIDs(ctx context.Context, params *WorkflowCleanupListFinalizedIDsParams) ([]string, error) {
-	schema := schemaKey("")
+	schema := ""
 	max := 100
 	var finalizedBefore time.Time
 	state := ""
 	if params != nil {
-		schema = schemaKey(params.Schema)
+		schema = params.Schema
 		max = limitDefault(params.LimitCount, max)
 		finalizedBefore = params.FinalizedBefore
 		state = params.State
@@ -2888,7 +2868,7 @@ func (e *Executor) WorkflowCleanupListFinalizedIDs(ctx context.Context, params *
 				ORDER BY id
 				LIMIT $3
 			) w
-		`, qTable(schema, "river_workflow")), nullableTime(finalizedBefore), state, max)
+		`, qt(schema, "river_workflow")), nullableTime(finalizedBefore), state, max)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -2937,19 +2917,19 @@ func (e *Executor) WorkflowFinalizeIfCompleteMany(ctx context.Context, params *W
 					INSERT INTO %s (id, state, finalized_at, updated_at)
 					VALUES ($1, 'completed', $2, $2)
 					ON CONFLICT (id) DO UPDATE SET state = 'completed', finalized_at = excluded.finalized_at, updated_at = excluded.updated_at
-				`, qTable(schemaKey(params.Schema), "river_workflow")), id, params.Now)
+				`, qt(params.Schema, "river_workflow")), id, params.Now)
 				if err != nil {
 					return out, err
 				}
 			} else {
 				compat.Lock()
-				if compat.workflows[schemaKey(params.Schema)] == nil {
-					compat.workflows[schemaKey(params.Schema)] = map[string]*Workflow{}
+				if compat.workflows[params.Schema] == nil {
+					compat.workflows[params.Schema] = map[string]*Workflow{}
 				}
-				w := compat.workflows[schemaKey(params.Schema)][id]
+				w := compat.workflows[params.Schema][id]
 				if w == nil {
 					w = &Workflow{ID: id, CreatedAt: params.Now, CurrentAttempt: 1}
-					compat.workflows[schemaKey(params.Schema)][id] = w
+					compat.workflows[params.Schema][id] = w
 				}
 				w.State = "completed"
 				w.FinalizedAt = &params.Now
@@ -2964,12 +2944,12 @@ func (e *Executor) WorkflowGetByID(ctx context.Context, params *WorkflowGetByIDP
 	if params == nil {
 		return nil, errors.New("riverpro driver: nil params")
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		return scanJSON[*Workflow](ctx, e.Executor, fmt.Sprintf(`
 			SELECT json_build_object('ID', id, 'Name', name, 'State', state, 'Metadata', encode(metadata::text::bytea, 'base64'), 'CurrentAttempt', current_attempt, 'CreatedAt', created_at, 'UpdatedAt', updated_at, 'FinalizedAt', finalized_at, 'WaitEvalCursorJobID', wait_eval_cursor_job_id)
 			FROM %s WHERE id = $1
-		`, qTable(schema, "river_workflow")), params.WorkflowID)
+		`, qt(schema, "river_workflow")), params.WorkflowID)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -3053,7 +3033,7 @@ func (e *Executor) WorkflowInsertMany(ctx context.Context, params *WorkflowInser
 	if params == nil {
 		return nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		now := nowUTC()
 		for i, id := range params.IDs {
@@ -3069,7 +3049,7 @@ func (e *Executor) WorkflowInsertMany(ctx context.Context, params *WorkflowInser
 				INSERT INTO %s (id, name, state, current_attempt, created_at, updated_at)
 				VALUES ($1, $2, 'active', 1, $3, $3)
 				ON CONFLICT (id) DO UPDATE SET name = coalesce(excluded.name, %s.name), updated_at = excluded.updated_at
-			`, qTable(schema, "river_workflow"), qTable(schema, "river_workflow")), id, name, now)
+			`, qt(schema, "river_workflow"), qt(schema, "river_workflow")), id, name, now)
 			if err != nil {
 				return err
 			}
@@ -3139,12 +3119,12 @@ func (e *Executor) WorkflowListActive(ctx context.Context, params *WorkflowListP
 	return out, nil
 }
 func (e *Executor) WorkflowListAll(ctx context.Context, params *WorkflowListParams) ([]*WorkflowListItem, error) {
-	schema := schemaKey("")
+	schema := ""
 	limit := 100
 	after := ""
 	before := ""
 	if params != nil {
-		schema = schemaKey(params.Schema)
+		schema = params.Schema
 		limit = limitDefault(params.PaginationLimit, limit)
 		after = params.After
 		before = params.Before
@@ -3158,7 +3138,7 @@ func (e *Executor) WorkflowListAll(ctx context.Context, params *WorkflowListPara
 				'CountFailedDeps', 0, 'CountPending', 0, 'CountRetryable', CASE WHEN state='retryable' THEN 1 ELSE 0 END,
 				'CountRunning', 0, 'CountScheduled', CASE WHEN state='active' THEN 1 ELSE 0 END) ORDER BY id), '[]'::json)
 			FROM (SELECT * FROM %s WHERE ($1 = '' OR id > $1) AND ($2 = '' OR id < $2) ORDER BY id LIMIT $3) w
-		`, qTable(schema, "river_workflow")), after, before, limit)
+		`, qt(schema, "river_workflow")), after, before, limit)
 	}
 	jobs, err := e.allWorkflowJobsAny(ctx, schema, limit*50)
 	if err != nil {
@@ -3189,9 +3169,9 @@ func (e *Executor) WorkflowListByIDs(ctx context.Context, params *WorkflowListBy
 	if params == nil {
 		return []string{}, nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
-		return scanJSON[[]string](ctx, e.Executor, fmt.Sprintf(`SELECT coalesce(json_agg(id ORDER BY id), '[]'::json) FROM %s WHERE id = ANY($1::text[])`, qTable(schema, "river_workflow")), params.WorkflowIDs)
+		return scanJSON[[]string](ctx, e.Executor, fmt.Sprintf(`SELECT coalesce(json_agg(id ORDER BY id), '[]'::json) FROM %s WHERE id = ANY($1::text[])`, qt(schema, "river_workflow")), params.WorkflowIDs)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -3420,10 +3400,10 @@ func (e *Executor) WorkflowSignalInsert(ctx context.Context, params *WorkflowSig
 	if params == nil {
 		return nil, errors.New("riverpro driver: nil params")
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	attempt := 1
 	if dbAvailable(e) {
-		cur, err := scanJSON[int](ctx, e.Executor, fmt.Sprintf(`SELECT to_json(current_attempt) FROM %s WHERE id = $1`, qTable(schema, "river_workflow")), params.WorkflowID)
+		cur, err := scanJSON[int](ctx, e.Executor, fmt.Sprintf(`SELECT to_json(current_attempt) FROM %s WHERE id = $1`, qt(schema, "river_workflow")), params.WorkflowID)
 		if err == nil {
 			attempt = cur
 		} else if err != rivertype.ErrNotFound {
@@ -3450,7 +3430,7 @@ func (e *Executor) WorkflowSignalInsert(ctx context.Context, params *WorkflowSig
 					'Payload', encode(payload::text::bytea, 'base64'), 'Metadata', encode(metadata::text::bytea, 'base64'), 'Source', encode(source::text::bytea, 'base64'),
 					'CreatedAt', created_at, 'CurrentAttempt', $4::int, 'PayloadSemanticEqual', payload = $5::jsonb, 'SignalPresent', true, 'SkippedAsDuplicate', true)
 				FROM %s WHERE workflow_id = $1 AND attempt = $2 AND idempotency_key = $3
-			`, qTable(schema, "river_workflow_signal")), params.WorkflowID, attempt, params.IdempotencyKey, attempt, payload)
+			`, qt(schema, "river_workflow_signal")), params.WorkflowID, attempt, params.IdempotencyKey, attempt, payload)
 			if err == nil {
 				return existing, nil
 			}
@@ -3464,7 +3444,7 @@ func (e *Executor) WorkflowSignalInsert(ctx context.Context, params *WorkflowSig
 			RETURNING json_build_object('ID', id, 'WorkflowID', workflow_id, 'Attempt', attempt, 'Key', key, 'IdempotencyKey', idempotency_key,
 				'Payload', encode(payload::text::bytea, 'base64'), 'Metadata', encode(metadata::text::bytea, 'base64'), 'Source', encode(source::text::bytea, 'base64'),
 				'CreatedAt', created_at, 'CurrentAttempt', $2::int, 'PayloadSemanticEqual', true, 'SignalPresent', true, 'SkippedAsDuplicate', false)
-		`, qTable(schema, "river_workflow_signal")), params.WorkflowID, attempt, params.Key, params.IdempotencyKey, payload, metadata, source)
+		`, qt(schema, "river_workflow_signal")), params.WorkflowID, attempt, params.Key, params.IdempotencyKey, payload, metadata, source)
 		return res, err
 	}
 	if params.RequestedAttempt != nil {
@@ -3538,7 +3518,7 @@ func (e *Executor) WorkflowSignalList(ctx context.Context, params *WorkflowSigna
 	if params == nil {
 		return []*WorkflowSignal{}, nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	keys := map[string]bool{}
 	var key string
 	if params.Key != nil {
@@ -3565,7 +3545,7 @@ func (e *Executor) WorkflowSignalList(ctx context.Context, params *WorkflowSigna
 			SELECT coalesce(json_agg(json_build_object('ID', id, 'WorkflowID', workflow_id, 'Attempt', attempt, 'Key', key, 'IdempotencyKey', idempotency_key,
 				'Payload', encode(payload::text::bytea, 'base64'), 'Metadata', encode(metadata::text::bytea, 'base64'), 'Source', encode(source::text::bytea, 'base64'), 'CreatedAt', created_at) ORDER BY id %s), '[]'::json)
 			FROM (SELECT * FROM %s WHERE workflow_id = $1 AND ($2::int = 0 OR attempt = $2) AND ($3 = '' OR key = $3) AND ($4::bigint = 0 OR id %s $4) ORDER BY id %s LIMIT $5) s
-		`, order, qTable(schema, "river_workflow_signal"), op, order), params.WorkflowID, attempt, key, cursor, limit)
+		`, order, qt(schema, "river_workflow_signal"), op, order), params.WorkflowID, attempt, key, cursor, limit)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -3582,7 +3562,7 @@ func (e *Executor) WorkflowSignalListByKeys(ctx context.Context, params *Workflo
 	if params == nil {
 		return []*WorkflowSignal{}, nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		attempt := 0
 		if params.Attempt != nil {
@@ -3603,7 +3583,7 @@ func (e *Executor) WorkflowSignalListByKeys(ctx context.Context, params *Workflo
 			SELECT coalesce(json_agg(json_build_object('ID', id, 'WorkflowID', workflow_id, 'Attempt', attempt, 'Key', key, 'IdempotencyKey', idempotency_key,
 				'Payload', encode(payload::text::bytea, 'base64'), 'Metadata', encode(metadata::text::bytea, 'base64'), 'Source', encode(source::text::bytea, 'base64'), 'CreatedAt', created_at) ORDER BY id %s), '[]'::json)
 			FROM (SELECT * FROM %s WHERE workflow_id = $1 AND ($2::int = 0 OR attempt = $2) AND (cardinality($3::text[]) = 0 OR key = ANY($3::text[])) AND ($4::bigint = 0 OR id %s $4) ORDER BY id %s LIMIT $5) s
-		`, order, qTable(schema, "river_workflow_signal"), op, order), params.WorkflowID, attempt, params.Keys, cursor, limit)
+		`, order, qt(schema, "river_workflow_signal"), op, order), params.WorkflowID, attempt, params.Keys, cursor, limit)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -3613,13 +3593,13 @@ func (e *Executor) WorkflowSignalListByWorkflowIDs(ctx context.Context, params *
 	if params == nil {
 		return []*WorkflowSignal{}, nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		return scanJSON[[]*WorkflowSignal](ctx, e.Executor, fmt.Sprintf(`
 			SELECT coalesce(json_agg(json_build_object('ID', id, 'WorkflowID', workflow_id, 'Attempt', attempt, 'Key', key, 'IdempotencyKey', idempotency_key,
 				'Payload', encode(payload::text::bytea, 'base64'), 'Metadata', encode(metadata::text::bytea, 'base64'), 'Source', encode(source::text::bytea, 'base64'), 'CreatedAt', created_at) ORDER BY workflow_id, id), '[]'::json)
 			FROM %s WHERE workflow_id = ANY($1::text[]) AND ($2::int = 0 OR attempt = $2) AND (cardinality($3::text[]) = 0 OR key = ANY($3::text[]))
-		`, qTable(schema, "river_workflow_signal")), params.WorkflowIDs, params.Attempt, params.Keys)
+		`, qt(schema, "river_workflow_signal")), params.WorkflowIDs, params.Attempt, params.Keys)
 	}
 	a := params.Attempt
 	out := []*WorkflowSignal{}
@@ -3682,7 +3662,7 @@ func (e *Executor) WorkflowTimerConsumeDue(ctx context.Context, params *Workflow
 	if params == nil {
 		return []*WorkflowTimer{}, nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	limit := limitDefault(params.LimitCount, 100)
 	if dbAvailable(e) {
 		return scanJSON[[]*WorkflowTimer](ctx, e.Executor, fmt.Sprintf(`
@@ -3691,7 +3671,7 @@ func (e *Executor) WorkflowTimerConsumeDue(ctx context.Context, params *Workflow
 				RETURNING workflow_id, next_fire_at
 			)
 			SELECT coalesce(json_agg(json_build_object('WorkflowID', workflow_id, 'NextFireAt', next_fire_at) ORDER BY next_fire_at, workflow_id), '[]'::json) FROM due
-		`, qTable(schema, "river_workflow_timer"), qTable(schema, "river_workflow_timer")), params.AsOf, limit)
+		`, qt(schema, "river_workflow_timer"), qt(schema, "river_workflow_timer")), params.AsOf, limit)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -3712,9 +3692,9 @@ func (e *Executor) WorkflowTimerDeleteByWorkflowIDs(ctx context.Context, params 
 	if params == nil {
 		return nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
-		return e.Executor.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE workflow_id = ANY($1::text[])`, qTable(schema, "river_workflow_timer")), params.WorkflowIDs)
+		return e.Executor.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE workflow_id = ANY($1::text[])`, qt(schema, "river_workflow_timer")), params.WorkflowIDs)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -3728,9 +3708,9 @@ func (e *Executor) WorkflowTimerGetByWorkflowID(ctx context.Context, params *Wor
 	if params == nil {
 		return nil, errors.New("riverpro driver: nil params")
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
-		return scanJSON[*WorkflowTimer](ctx, e.Executor, fmt.Sprintf(`SELECT json_build_object('WorkflowID', workflow_id, 'NextFireAt', next_fire_at) FROM %s WHERE workflow_id = $1`, qTable(schema, "river_workflow_timer")), params.WorkflowID)
+		return scanJSON[*WorkflowTimer](ctx, e.Executor, fmt.Sprintf(`SELECT json_build_object('WorkflowID', workflow_id, 'NextFireAt', next_fire_at) FROM %s WHERE workflow_id = $1`, qt(schema, "river_workflow_timer")), params.WorkflowID)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -3744,12 +3724,12 @@ func (e *Executor) WorkflowTimerNextFireAtByWorkflowIDs(ctx context.Context, par
 	if params == nil {
 		return []*WorkflowTimerNextFireAtByWorkflowIDsRow{}, nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		return scanJSON[[]*WorkflowTimerNextFireAtByWorkflowIDsRow](ctx, e.Executor, fmt.Sprintf(`
 			SELECT coalesce(json_agg(json_build_object('WorkflowID', workflow_id, 'NextFireAt', next_fire_at) ORDER BY workflow_id), '[]'::json)
 			FROM %s WHERE workflow_id = ANY($1::text[]) AND ($2::timestamptz = '0001-01-01 00:00:00+00'::timestamptz OR next_fire_at > $2)
-		`, qTable(schema, "river_workflow_timer")), params.WorkflowIDs, params.Now)
+		`, qt(schema, "river_workflow_timer")), params.WorkflowIDs, params.Now)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -3765,13 +3745,13 @@ func (e *Executor) WorkflowTimerUpsertMany(ctx context.Context, params *Workflow
 	if params == nil {
 		return nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		for i, id := range params.WorkflowIDs {
 			if i >= len(params.NextFireAts) || id == "" {
 				continue
 			}
-			if err := e.Executor.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (workflow_id, next_fire_at) VALUES ($1, $2) ON CONFLICT (workflow_id) DO UPDATE SET next_fire_at = excluded.next_fire_at`, qTable(schema, "river_workflow_timer")), id, params.NextFireAts[i]); err != nil {
+			if err := e.Executor.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (workflow_id, next_fire_at) VALUES ($1, $2) ON CONFLICT (workflow_id) DO UPDATE SET next_fire_at = excluded.next_fire_at`, qt(schema, "river_workflow_timer")), id, params.NextFireAts[i]); err != nil {
 				return err
 			}
 		}
@@ -3802,7 +3782,7 @@ func (e *Executor) WorkflowUnfinalizeIfActiveJobsMany(ctx context.Context, param
 		if n > 0 {
 			out = append(out, id)
 			compat.Lock()
-			if w := compat.workflows[schemaKey(params.Schema)][id]; w != nil {
+			if w := compat.workflows[params.Schema][id]; w != nil {
 				w.FinalizedAt = nil
 				w.State = "active"
 				w.UpdatedAt = params.Now
@@ -3889,13 +3869,13 @@ func (e *Executor) WorkflowWaitEvalCursorUpdateByWorkflowIDMany(ctx context.Cont
 	if params == nil {
 		return nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		for i, id := range params.WorkflowIDs {
 			if i >= len(params.CursorJobIDs) || id == "" {
 				continue
 			}
-			if err := e.Executor.Exec(ctx, fmt.Sprintf(`UPDATE %s SET wait_eval_cursor_job_id = $1, updated_at = now() WHERE id = $2`, qTable(schema, "river_workflow")), params.CursorJobIDs[i], id); err != nil {
+			if err := e.Executor.Exec(ctx, fmt.Sprintf(`UPDATE %s SET wait_eval_cursor_job_id = $1, updated_at = now() WHERE id = $2`, qt(schema, "river_workflow")), params.CursorJobIDs[i], id); err != nil {
 				return err
 			}
 		}
@@ -3935,12 +3915,12 @@ func (e *Executor) WorkflowWorklistDeleteByWorkflowIDsReturningReasons(ctx conte
 	if params == nil {
 		return []*WorkflowWorklistDeleteByWorkflowIDsReturningReasonsRow{}, nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		return scanJSON[[]*WorkflowWorklistDeleteByWorkflowIDsReturningReasonsRow](ctx, e.Executor, fmt.Sprintf(`
 			WITH deleted AS (DELETE FROM %s WHERE workflow_id = ANY($1::text[]) RETURNING workflow_id, reason)
 			SELECT coalesce(json_agg(json_build_object('WorkflowID', workflow_id, 'Reason', reason) ORDER BY workflow_id, reason), '[]'::json) FROM deleted
-		`, qTable(schema, "river_workflow_worklist")), params.WorkflowIDs)
+		`, qt(schema, "river_workflow_worklist")), params.WorkflowIDs)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -3958,13 +3938,13 @@ func (e *Executor) WorkflowWorklistInsertMany(ctx context.Context, params *Workf
 	if params == nil {
 		return nil
 	}
-	schema := schemaKey(params.Schema)
+	schema := params.Schema
 	if dbAvailable(e) {
 		for _, id := range params.WorkflowIDs {
 			if id == "" {
 				continue
 			}
-			if err := e.Executor.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (workflow_id, reason) VALUES ($1, $2) ON CONFLICT (workflow_id, reason) DO NOTHING`, qTable(schema, "river_workflow_worklist")), id, params.Reason); err != nil {
+			if err := e.Executor.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (workflow_id, reason) VALUES ($1, $2) ON CONFLICT (workflow_id, reason) DO NOTHING`, qt(schema, "river_workflow_worklist")), id, params.Reason); err != nil {
 				return err
 			}
 		}
@@ -3995,11 +3975,11 @@ func (e *Executor) WorkflowWorklistListIDs(ctx context.Context, params *Workflow
 	return out, nil
 }
 func (e *Executor) WorkflowWorklistList(ctx context.Context, params *WorkflowWorklistListParams) ([]*WorkflowWorklistItem, error) {
-	schema := schemaKey("")
+	schema := ""
 	limit := 100
 	after := int64(0)
 	if params != nil {
-		schema = schemaKey(params.Schema)
+		schema = params.Schema
 		limit = limitDefault(params.LimitCount, limit)
 		after = params.AfterID
 	}
@@ -4007,7 +3987,7 @@ func (e *Executor) WorkflowWorklistList(ctx context.Context, params *WorkflowWor
 		return scanJSON[[]*WorkflowWorklistItem](ctx, e.Executor, fmt.Sprintf(`
 			SELECT coalesce(json_agg(json_build_object('ID', id, 'WorkflowID', workflow_id, 'Reason', reason, 'CreatedAt', created_at) ORDER BY id), '[]'::json)
 			FROM (SELECT * FROM %s WHERE id > $1 ORDER BY id LIMIT $2) w
-		`, qTable(schema, "river_workflow_worklist")), after, limit)
+		`, qt(schema, "river_workflow_worklist")), after, limit)
 	}
 	compat.Lock()
 	defer compat.Unlock()
