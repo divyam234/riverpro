@@ -90,6 +90,24 @@ func TestConcurrencyConfigPublicAPI(t *testing.T) {
 	}
 }
 
+func TestConfigWithDefaultsWorkflowAwareRetention(t *testing.T) {
+	cfg := (&Config{WorkflowAwareRetention: true}).WithDefaults()
+	if !cfg.WorkflowAwareRetention {
+		t.Fatal("WorkflowAwareRetention should be preserved through WithDefaults")
+	}
+	if cfg.WorkflowCancelledRetentionPeriod == 0 {
+		t.Fatal("WorkflowCancelledRetentionPeriod should have a default")
+	}
+	if cfg.WorkflowClosedRetentionPeriod == 0 {
+		t.Fatal("WorkflowClosedRetentionPeriod should have a default")
+	}
+
+	cfg = (&Config{}).WithDefaults()
+	if cfg.WorkflowAwareRetention {
+		t.Fatal("WorkflowAwareRetention should default to false")
+	}
+}
+
 func TestWorkflowSignalsPublicAPI(t *testing.T) {
 	ctx := context.Background()
 	workflow := NewWorkflow(&WorkflowOpts{ID: "wf-signals-api"})

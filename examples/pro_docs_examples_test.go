@@ -293,7 +293,7 @@ func testExampleWorkflowDependencyOutput(t *testing.T) {
 	client := newExampleClient(t, ctx, pool, &riverpro.Config{})
 	workflow := client.NewWorkflow(&riverpro.WorkflowOpts{ID: "wf_dependency_output", Name: "Ship order"})
 	fraudTask := workflow.Add("score_fraud", docsFraudScoreArgs{OrderID: "ord_123"}, &river.InsertOpts{Metadata: mustJSON(t, map[string]any{rivertype.MetadataKeyOutput: map[string]any{"score": 0.08}})}, nil)
-	workflow.Add("ship_order", docsShipOrderArgs{OrderID: "ord_123"}, nil, &riverpro.WorkflowTaskOpts{Deps: []string{fraudTask.Name}})
+	shipTask := workflow.Add("ship_order", docsShipOrderArgs{OrderID: "ord_123"}, nil, &riverpro.WorkflowTaskOpts{Deps: []string{fraudTask.Name}})
 	prepared, err := workflow.Prepare(ctx)
 	require.NoError(t, err)
 	_, err = client.InsertMany(ctx, prepared.Jobs)
@@ -301,14 +301,14 @@ func testExampleWorkflowDependencyOutput(t *testing.T) {
 	loaded, err := workflow.LoadAll(ctx, nil)
 	require.NoError(t, err)
 	require.Equal(t, []string{"score_fraud", "ship_order"}, loaded.Names())
+	deps, err := workflow.LoadDeps(ctx, shipTask.Name, &riverpro.WorkflowLoadDepsOpts{Recursive: true})
+	require.NoError(t, err)
+	require.Equal(t, []string{"score_fraud"}, deps.Names())
 	var output struct {
 		Score float64 `json:"score"`
 	}
-	require.NoError(t, workflow.LoadOutput(ctx, "score_fraud", &output))
+	require.NoError(t, deps.Output(fraudTask.Name, &output))
 	require.Equal(t, 0.08, output.Score)
-	deps, err := workflow.LoadDeps(ctx, "ship_order", &riverpro.WorkflowLoadDepsOpts{Recursive: true})
-	require.NoError(t, err)
-	require.Equal(t, []string{"score_fraud"}, deps.Names())
 }
 
 func testExampleWorkflowTaskSignalData(t *testing.T) {
@@ -329,21 +329,38 @@ func testExampleWorkflowTaskSignalData(t *testing.T) {
 
 func testExampleWorkflowWaitMixedTermsAndRawCEL(t *testing.T) {
 	ctx := context.Background()
+	// Mix a structured term (risk_hold_received) with a raw-CEL signal input
+	// (risk_override) in the same top-level wait expression. The structured term
+	// is recorded as a `WaitTerm` with its own `.Result.Satisfied`, while the raw
+	// CEL signal is only tracked as a `WaitSignalInput` whose `IncludedCount`
+	// the expression evaluates against.
 	wait := &riverworkflow.WaitSpec{
-		Expr: "manager_approval || fallback_timer",
+		Expr: `risk_hold_received || signals["risk_override"].exists(s, s.payload.active == false)`,
+		Inputs: riverworkflow.WaitInputs{
+			Signals: []string{"risk_override"},
+		},
 		Terms: []riverworkflow.WaitTermSpec{
-			riverworkflow.WaitTermSignal("manager_approval", "manager_approval", "payload.approved == true"),
-			riverworkflow.WaitTermTimer(riverworkflow.TimerAfterWorkflowCreated("fallback_timer", time.Hour)),
+			riverworkflow.WaitTermSignal("risk_hold_received", "risk_hold", "payload.active == true"),
 		},
 	}
 	workflow := newPreparedWorkflow(t, ctx, "wf_wait_mixed", "resolve_mixed_risk_hold", docsRiskHoldArgs{OrderID: "ord_123"}, &riverpro.WorkflowTaskOpts{Wait: wait})
+	_, err := workflow.Signal(ctx, "risk_override", map[string]any{"active": false}, nil)
+	require.NoError(t, err)
+
 	task, err := workflow.LoadTask(ctx, "resolve_mixed_risk_hold")
 	require.NoError(t, err)
 	require.NotNil(t, task.Wait)
-	require.Equal(t, "manager_approval", task.Wait.SignalInput("manager_approval").Key)
-	diagnostics, err := workflow.TaskWaitDiagnostics(ctx, "resolve_mixed_risk_hold", nil)
-	require.NoError(t, err)
-	require.Equal(t, riverworkflow.WaitPhaseNotStarted, diagnostics.Phase)
+
+	// Structured term: risk_hold_received should not have fired (no risk_hold signal was emitted).
+	holdTerm := task.Wait.Term("risk_hold_received")
+	require.NotNil(t, holdTerm)
+	require.NotNil(t, holdTerm.Result)
+	require.False(t, holdTerm.Result.Satisfied, "risk_hold_received term should not be satisfied when only risk_override was emitted")
+
+	// Raw-CEL input: risk_override should be present in the inputs.
+	overrideInput := task.Wait.SignalInput("risk_override")
+	require.NotNil(t, overrideInput)
+	require.Equal(t, "risk_override", overrideInput.Key)
 }
 
 func testExampleWorkflowWaitRawCEL(t *testing.T) {
@@ -369,9 +386,32 @@ func testExampleWorkflowWaitResultTimeoutVsSignal(t *testing.T) {
 	workflow := newPreparedWorkflow(t, ctx, "wf_timeout_vs_signal", "decide_shipment", docsRiskHoldArgs{OrderID: "ord_123"}, &riverpro.WorkflowTaskOpts{Wait: wait})
 	_, err := workflow.Signal(ctx, "review_decision", map[string]any{"decision": "ship"}, nil)
 	require.NoError(t, err)
-	latest, err := workflow.SignalGetLatestForTask(ctx, "decide_shipment", "review_decision", nil)
+
+	// Introspect the task's wait to determine *why* it resolved (signal vs timer fallback).
+	self, err := workflow.LoadTask(ctx, "decide_shipment")
 	require.NoError(t, err)
-	require.Equal(t, "review_decision", latest.Key)
+	require.NotNil(t, self.Wait)
+	require.NotNil(t, self.Wait.ResolvedAt)
+
+	// Signal path: review_decision term is satisfied and the signal input has at least one included signal.
+	decisionTerm := self.Wait.Term("review_decision")
+	require.NotNil(t, decisionTerm)
+	require.NotNil(t, decisionTerm.Result)
+	require.True(t, decisionTerm.Result.Satisfied, "review_decision term should be satisfied")
+	decisionInput := self.Wait.SignalInput("review_decision")
+	require.NotNil(t, decisionInput)
+	require.NotNil(t, decisionInput.Result)
+	require.Greater(t, decisionInput.Result.IncludedCount, int64(0))
+
+	// Timer path: timeout term is recorded as not-satisfied and the timer is not yet fired.
+	timeoutTerm := self.Wait.Term("timeout")
+	require.NotNil(t, timeoutTerm)
+	require.NotNil(t, timeoutTerm.Result)
+	require.False(t, timeoutTerm.Result.Satisfied, "timeout term should not be satisfied when signal won")
+	timeoutInput := self.Wait.TimerInput("timeout")
+	require.NotNil(t, timeoutInput)
+	require.NotNil(t, timeoutInput.Result)
+	require.False(t, timeoutInput.Result.Fired, "timeout timer should not have fired when signal won")
 }
 
 func testExampleWorkflowWaitSignalQuorum(t *testing.T) {

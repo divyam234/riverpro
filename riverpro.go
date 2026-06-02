@@ -51,6 +51,7 @@ type Config struct {
 	PartitionKeyCacheTTL             time.Duration
 	ProQueues                        map[string]QueueConfig
 	SequenceSchedulerInterval        time.Duration
+	WorkflowAwareRetention           bool
 	WorkflowCancelledRetentionPeriod time.Duration
 	WorkflowClosedRetentionPeriod    time.Duration
 	WorkflowEvaluatorBatchSize       int
@@ -214,6 +215,7 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	}
 	go c.workflowEvaluatorLoop(ctx)
 	go c.queueRetentionCleanerLoop(ctx)
+	go c.workflowRetentionCleanerLoop(ctx)
 	return nil
 }
 
@@ -261,6 +263,95 @@ func (c *Client[TTx]) cleanProQueuesOnce(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (c *Client[TTx]) workflowRetentionCleanerLoop(ctx context.Context) {
+	if c == nil || c.proDriver == nil || c.config == nil || !c.config.WorkflowAwareRetention {
+		return
+	}
+	interval := c.config.WorkflowRescuerInterval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = c.cleanWorkflowRetentionOnce(ctx)
+		}
+	}
+}
+
+func (c *Client[TTx]) cleanWorkflowRetentionOnce(ctx context.Context) error {
+	if c == nil || c.proDriver == nil || c.config == nil || !c.config.WorkflowAwareRetention {
+		return nil
+	}
+	exec := c.proDriver.GetProExecutor()
+	now := time.Now()
+	states := []struct {
+		period time.Duration
+		state  string
+	}{
+		{c.config.WorkflowCancelledRetentionPeriod, "cancelled"},
+		{c.config.WorkflowClosedRetentionPeriod, "completed"},
+	}
+	for _, s := range states {
+		if s.period == 0 {
+			continue
+		}
+		if err := c.cleanWorkflowStateOnce(ctx, exec, now.Add(-s.period), s.state); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client[TTx]) cleanWorkflowStateOnce(ctx context.Context, exec prodriver.ProExecutor, finalizedBefore time.Time, state string) error {
+	const batchSize = 100
+	for {
+		ids, err := exec.WorkflowCleanupListFinalizedIDs(ctx, &prodriver.WorkflowCleanupListFinalizedIDsParams{
+			FinalizedBefore: finalizedBefore,
+			LimitCount:      batchSize,
+			Schema:          c.config.Schema,
+			State:           state,
+		})
+		if err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		if err := exec.WorkflowCleanupDeleteAttemptTasksByWorkflowIDs(ctx, &prodriver.WorkflowCleanupDeleteByWorkflowIDsParams{Schema: c.config.Schema, WorkflowIDs: ids}); err != nil {
+			return err
+		}
+		if err := exec.WorkflowCleanupDeleteAttemptsByWorkflowIDs(ctx, &prodriver.WorkflowCleanupDeleteByWorkflowIDsParams{Schema: c.config.Schema, WorkflowIDs: ids}); err != nil {
+			return err
+		}
+		if err := exec.WorkflowCleanupDeleteDeadLetterJobsByWorkflowIDs(ctx, &prodriver.WorkflowCleanupDeleteByWorkflowIDsParams{Schema: c.config.Schema, WorkflowIDs: ids}); err != nil {
+			return err
+		}
+		if err := exec.WorkflowCleanupDeleteJobsByWorkflowIDs(ctx, &prodriver.WorkflowCleanupDeleteByWorkflowIDsParams{Schema: c.config.Schema, WorkflowIDs: ids}); err != nil {
+			return err
+		}
+		if err := exec.WorkflowCleanupDeleteSignalsByWorkflowIDs(ctx, &prodriver.WorkflowCleanupDeleteByWorkflowIDsParams{Schema: c.config.Schema, WorkflowIDs: ids}); err != nil {
+			return err
+		}
+		if err := exec.WorkflowCleanupDeleteTimersByWorkflowIDs(ctx, &prodriver.WorkflowCleanupDeleteByWorkflowIDsParams{Schema: c.config.Schema, WorkflowIDs: ids}); err != nil {
+			return err
+		}
+		if err := exec.WorkflowCleanupDeleteWorklistByWorkflowIDs(ctx, &prodriver.WorkflowCleanupDeleteByWorkflowIDsParams{Schema: c.config.Schema, WorkflowIDs: ids}); err != nil {
+			return err
+		}
+		if err := exec.WorkflowCleanupDeleteWorkflowsByWorkflowIDs(ctx, &prodriver.WorkflowCleanupDeleteWorkflowsByWorkflowIDsParams{Schema: c.config.Schema, State: state, WorkflowIDs: ids}); err != nil {
+			return err
+		}
+		if len(ids) < batchSize {
+			return nil
+		}
+	}
 }
 
 func (c *Client[TTx]) workflowEvaluatorLoop(ctx context.Context) {
