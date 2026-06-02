@@ -89,3 +89,37 @@ func TestConcurrencyConfigPublicAPI(t *testing.T) {
 		t.Fatalf("unexpected concurrency config: %#v", cfg)
 	}
 }
+
+func TestWorkflowSignalsPublicAPI(t *testing.T) {
+	ctx := context.Background()
+	workflow := NewWorkflow(&WorkflowOpts{ID: "wf-signals-api"})
+	signals := workflow.Signals()
+	if signals == nil {
+		t.Fatal("expected workflow signals handle")
+	}
+
+	_, err := signals.Emit(ctx, "manual_review", map[string]any{"approved": true}, &WorkflowSignalEmitOpts{IdempotencyKey: "request-id"})
+	if err == nil {
+		t.Fatal("expected Emit to require a configured Pro driver")
+	}
+	_, err = signals.List(ctx, &WorkflowSignalListParams{Key: "manual_review"})
+	if err == nil {
+		t.Fatal("expected List to require a configured Pro driver")
+	}
+	_, err = signals.ListForTask(ctx, "approve_order", &WorkflowSignalListForTaskParams{Key: "manual_review"})
+	if err == nil {
+		t.Fatal("expected ListForTask to require a configured Pro driver")
+	}
+	_, err = signals.LatestForTask(ctx, "approve_order", "manual_review", &WorkflowSignalLatestForTaskOpts{})
+	if err == nil {
+		t.Fatal("expected LatestForTask to require a configured Pro driver")
+	}
+}
+
+func TestWorkflowWaitDiagnosticsPublicAPI(t *testing.T) {
+	workflow := NewWorkflow(&WorkflowOpts{ID: "wf-diagnostics-api"})
+	_, err := workflow.WaitDiagnostics(context.Background(), "approve_order", &WorkflowWaitDiagnosticsOpts{SignalScanLimit: 10})
+	if err == nil {
+		t.Fatal("expected WaitDiagnostics to require a configured workflow task")
+	}
+}

@@ -457,7 +457,7 @@ func testExampleLatestEvidenceSignal(t *testing.T) {
 	require.NoError(t, err)
 	_, err = workflow.Signal(ctx, "override_decision", map[string]any{"approved": true, "reason": "customer verified"}, nil)
 	require.NoError(t, err)
-	latest, err := workflow.SignalGetLatestForTask(ctx, "resolve_risk_hold", "override_decision", nil)
+	latest, err := workflow.SignalGetLatestForTask(ctx, "resolve_risk_hold", "override_decision", &riverpro.WorkflowSignalGetLatestForTaskOpts{IncludeAfterResolution: true})
 	require.NoError(t, err)
 	var payload struct {
 		Approved bool   `json:"approved"`

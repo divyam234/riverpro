@@ -1500,7 +1500,26 @@ func readyWorkflowJob(job *rivertype.JobRow, byTask map[string]*rivertype.JobRow
 			return false
 		}
 	}
+	if len(jobWaitRaw(job)) > 0 && !jobWaitResolved(job) {
+		return false
+	}
 	return true
+}
+func jobWaitResolved(job *rivertype.JobRow) bool {
+	if job == nil {
+		return false
+	}
+	var metadata map[string]json.RawMessage
+	if err := json.Unmarshal(job.Metadata, &metadata); err != nil {
+		return false
+	}
+	var wait struct {
+		Phase int `json:"phase"`
+	}
+	if err := json.Unmarshal(metadata["workflow_wait"], &wait); err != nil {
+		return false
+	}
+	return wait.Phase == 2
 }
 func workflowListItemFromJobs(id string, jobs []*rivertype.JobRow) *WorkflowListItem {
 	item := &WorkflowListItem{ID: id}
@@ -3430,7 +3449,7 @@ func (e *Executor) WorkflowSignalInsert(ctx context.Context, params *WorkflowSig
 					'Payload', encode(payload::text::bytea, 'base64'), 'Metadata', encode(metadata::text::bytea, 'base64'), 'Source', encode(source::text::bytea, 'base64'),
 					'CreatedAt', created_at, 'CurrentAttempt', $4::int, 'PayloadSemanticEqual', payload = $5::jsonb, 'SignalPresent', true, 'SkippedAsDuplicate', true)
 				FROM %s WHERE workflow_id = $1 AND attempt = $2 AND idempotency_key = $3
-			`, qt(schema, "river_workflow_signal")), params.WorkflowID, attempt, params.IdempotencyKey, attempt, payload)
+			`, qt(schema, "river_workflow_signal")), params.WorkflowID, attempt, params.IdempotencyKey, cur, payload)
 			if err == nil {
 				return existing, nil
 			}
@@ -3443,8 +3462,8 @@ func (e *Executor) WorkflowSignalInsert(ctx context.Context, params *WorkflowSig
 			VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb)
 			RETURNING json_build_object('ID', id, 'WorkflowID', workflow_id, 'Attempt', attempt, 'Key', key, 'IdempotencyKey', idempotency_key,
 				'Payload', encode(payload::text::bytea, 'base64'), 'Metadata', encode(metadata::text::bytea, 'base64'), 'Source', encode(source::text::bytea, 'base64'),
-				'CreatedAt', created_at, 'CurrentAttempt', $2::int, 'PayloadSemanticEqual', true, 'SignalPresent', true, 'SkippedAsDuplicate', false)
-		`, qt(schema, "river_workflow_signal")), params.WorkflowID, attempt, params.Key, params.IdempotencyKey, payload, metadata, source)
+				'CreatedAt', created_at, 'CurrentAttempt', $8::int, 'PayloadSemanticEqual', true, 'SignalPresent', true, 'SkippedAsDuplicate', false)
+		`, qt(schema, "river_workflow_signal")), params.WorkflowID, attempt, params.Key, params.IdempotencyKey, payload, metadata, source, cur)
 		return res, err
 	}
 	if params.RequestedAttempt != nil {

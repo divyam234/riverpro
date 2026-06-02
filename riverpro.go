@@ -17,6 +17,7 @@ import (
 	"github.com/divyam234/riverpro/riverworkflow"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/rivertype"
+	"github.com/tidwall/gjson"
 )
 
 type BatchOpts struct{ ByArgs bool }
@@ -292,6 +293,9 @@ func (c *Client[TTx]) workflowEvaluateReady(ctx context.Context) error {
 		if item == nil || item.ID == "" {
 			continue
 		}
+		if err := c.workflowEvaluateWaits(ctx, exec, item.ID); err != nil {
+			return err
+		}
 		ready, err := exec.WorkflowReadyTaskIDsByWorkflowIDs(ctx, &prodriver.WorkflowReadyTaskIDsByWorkflowIDsParams{LimitCount: c.config.WorkflowEvaluatorBatchSize, Schema: c.config.Schema, WorkflowIDs: []string{item.ID}})
 		if err != nil {
 			return err
@@ -308,6 +312,136 @@ func (c *Client[TTx]) workflowEvaluateReady(ctx context.Context) error {
 		_, _ = exec.WorkflowFinalizeIfCompleteMany(ctx, &prodriver.WorkflowFinalizeIfCompleteManyParams{Now: time.Now(), Schema: c.config.Schema, WorkflowIDs: []string{item.ID}})
 	}
 	return nil
+}
+
+func (c *Client[TTx]) workflowEvaluateWaits(ctx context.Context, exec prodriver.ProExecutor, workflowID string) error {
+	if c == nil || c.config == nil || exec == nil || workflowID == "" {
+		return nil
+	}
+	workflow, err := exec.WorkflowGetByID(ctx, &prodriver.WorkflowGetByIDParams{Schema: c.config.Schema, WorkflowID: workflowID})
+	if err != nil {
+		if errors.Is(err, rivertype.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	tasks, err := exec.WorkflowJobList(ctx, &prodriver.WorkflowJobListParams{PaginationLimit: c.config.WorkflowEvaluatorBatchSize, Schema: c.config.Schema, WorkflowID: workflowID})
+	if err != nil {
+		return err
+	}
+	jobsByTask := map[string]*rivertype.JobRow{}
+	for _, task := range tasks {
+		if task != nil && task.Job != nil && task.Task != "" {
+			jobsByTask[task.Task] = task.Job
+		}
+	}
+	now := time.Now().UTC()
+	for _, task := range tasks {
+		if task == nil || task.Job == nil || task.Job.State != rivertype.JobStatePending {
+			continue
+		}
+		waitSpec, waitState, err := waitSpecAndStateFromMetadata(task.Job.Metadata)
+		if err != nil || waitSpec == nil || (waitState != nil && waitState.Phase == riverworkflow.WaitPhaseResolved) {
+			continue
+		}
+		if !workflowDepsSatisfied(task.Deps, jobsByTask) {
+			continue
+		}
+		startedAt := now
+		if waitState != nil && waitState.StartedAt != nil {
+			startedAt = *waitState.StartedAt
+		}
+		resolved, wait, err := c.evaluateWait(ctx, exec, workflowID, workflow.CurrentAttempt, task.Task, waitSpec, startedAt, now)
+		if err != nil {
+			return err
+		}
+		if !resolved {
+			if waitState == nil || waitState.Phase == riverworkflow.WaitPhaseNotStarted {
+				wait.Phase = riverworkflow.WaitPhaseWaiting
+				wait.StartedAt = &now
+				if err := updateJobWaitMetadata(ctx, exec, c.config.Schema, task.Job.ID, wait); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		wait.Phase = riverworkflow.WaitPhaseResolved
+		wait.StartedAt = firstNonNilTime(wait.StartedAt, &now)
+		wait.ResolvedAt = &now
+		wait.Evidence = &riverworkflow.WaitEvidence{EvaluatedAt: now, WorkflowAttempt: workflow.CurrentAttempt}
+		wait.Summary = "wait resolved"
+		if err := updateJobWaitMetadata(ctx, exec, c.config.Schema, task.Job.ID, wait); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client[TTx]) evaluateWait(ctx context.Context, exec prodriver.ProExecutor, workflowID string, attempt int, taskName string, waitSpec *riverworkflow.WaitSpec, startedAt time.Time, now time.Time) (bool, *riverworkflow.Wait, error) {
+	wait := waitSpec.Status()
+	wait.Phase = riverworkflow.WaitPhaseWaiting
+	wait.StartedAt = &startedAt
+	keys := waitSpec.SignalKeys()
+	signals, err := exec.WorkflowSignalListByKeys(ctx, &prodriver.WorkflowSignalListByKeysParams{Attempt: &attempt, Keys: keys, LimitCount: 100000, Schema: c.config.Schema, WorkflowID: workflowID})
+	if err != nil {
+		return false, nil, err
+	}
+	signalsByKey := map[string][]*prodriver.WorkflowSignal{}
+	for _, signal := range signals {
+		if signal != nil {
+			signalsByKey[signal.Key] = append(signalsByKey[signal.Key], signal)
+		}
+	}
+	termResults := map[string]bool{}
+	for i := range wait.Terms {
+		term := &wait.Terms[i]
+		switch term.Kind {
+		case riverworkflow.WaitTermKindSignal:
+			matched, lastID := matchingSignalCount(signalsByKey[term.SignalKey], term.Expr)
+			required := term.RequiredCount
+			if required <= 0 {
+				required = 1
+			}
+			satisfied := matched >= required
+			term.Result = &riverworkflow.WaitTermStatusResult{LastMatchedID: lastID, MatchedCount: matched, Satisfied: satisfied}
+			termResults[term.Name] = satisfied
+		case riverworkflow.WaitTermKindTimer:
+			timer := findTimer(waitSpec.Timers(), term.TimerName)
+			satisfied, fireAt := timerSatisfied(timer, startedAt, now)
+			term.Result = &riverworkflow.WaitTermStatusResult{Satisfied: satisfied}
+			termResults[term.Name] = satisfied
+			for j := range wait.Inputs.Timers {
+				if wait.Inputs.Timers[j].Name == term.TimerName {
+					wait.Inputs.Timers[j].FireAt = fireAt
+					wait.Inputs.Timers[j].Result = &riverworkflow.WaitTimerInputResult{FireAt: fireAt, Fired: satisfied}
+				}
+			}
+		case riverworkflow.WaitTermKindGeneric:
+			satisfied := evalGenericExpr(term.Expr, signalsByKey, termResults)
+			term.Result = &riverworkflow.WaitTermStatusResult{Satisfied: satisfied}
+			termResults[term.Name] = satisfied
+		}
+	}
+	for i := range wait.Inputs.Signals {
+		rows := signalsByKey[wait.Inputs.Signals[i].Key]
+		lastID := lastSignalID(rows)
+		wait.Inputs.Signals[i].Result = &riverworkflow.WaitSignalInputResult{IncludedCount: int64(len(rows)), LastIncludedID: lastID}
+	}
+	if waitSpec.Expr != "" {
+		return evalTopExpr(waitSpec.Expr, signalsByKey, termResults), wait, nil
+	}
+	if len(wait.Terms) == 0 {
+		return len(keys) == 0 || anySignal(signalsByKey), wait, nil
+	}
+	if len(wait.Terms) == 1 {
+		return termResults[wait.Terms[0].Name], wait, nil
+	}
+	for _, ok := range termResults {
+		if !ok {
+			return false, wait, nil
+		}
+	}
+	return len(termResults) > 0, wait, nil
 }
 
 type workflowRuntimeHook[TTx any] struct {
@@ -347,6 +481,231 @@ func (h *workflowRuntimeHook[TTx]) WorkEnd(ctx context.Context, job *rivertype.J
 		_, _ = exec.WorkflowFinalizeIfCompleteMany(context.Background(), &prodriver.WorkflowFinalizeIfCompleteManyParams{Now: time.Now(), Schema: h.schema, WorkflowIDs: []string{workflowID}})
 	}()
 	return workErr
+}
+
+func workflowDepsSatisfied(deps []string, jobsByTask map[string]*rivertype.JobRow) bool {
+	for _, dep := range deps {
+		job := jobsByTask[dep]
+		if job == nil || job.State != rivertype.JobStateCompleted {
+			return false
+		}
+	}
+	return true
+}
+
+func waitSpecAndStateFromMetadata(metadata []byte) (*riverworkflow.WaitSpec, *riverworkflow.Wait, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(metadata, &raw); err != nil {
+		return nil, nil, err
+	}
+	waitRaw := raw[riverworkflow.MetadataKeyWorkflowWait]
+	if len(waitRaw) == 0 {
+		return nil, nil, nil
+	}
+	state, err := riverworkflow.WaitFromMetadata(metadata)
+	if err != nil {
+		return nil, nil, err
+	}
+	var spec riverworkflow.WaitSpec
+	if err := json.Unmarshal(waitRaw, &spec); err == nil && (spec.Expr != "" || len(spec.Terms) > 0 || len(spec.Inputs.Signals) > 0 || len(spec.Inputs.Timers) > 0) {
+		return &spec, state, nil
+	}
+	if state == nil {
+		return nil, nil, nil
+	}
+	spec.Expr = state.Expr
+	for _, signal := range state.Inputs.Signals {
+		spec.Inputs.Signals = append(spec.Inputs.Signals, signal.Key)
+	}
+	for _, timer := range state.Inputs.Timers {
+		if timer.FireAt != nil {
+			spec.Inputs.Timers = append(spec.Inputs.Timers, riverworkflow.TimerAt(timer.Name, *timer.FireAt))
+		} else if timer.After != nil {
+			spec.Inputs.Timers = append(spec.Inputs.Timers, riverworkflow.TimerAfterWaitStarted(timer.Name, *timer.After))
+		}
+	}
+	for _, term := range state.Terms {
+		switch term.Kind {
+		case riverworkflow.WaitTermKindSignal:
+			t := riverworkflow.WaitTermSignal(term.Name, term.SignalKey, term.Expr)
+			if term.RequiredCount > 0 {
+				t = t.Count(int(term.RequiredCount))
+			}
+			spec.Terms = append(spec.Terms, t)
+		case riverworkflow.WaitTermKindTimer:
+			timer := findTimer(spec.Inputs.Timers, term.TimerName)
+			if timer.Name() != "" {
+				spec.Terms = append(spec.Terms, riverworkflow.WaitTermTimer(timer))
+			}
+		case riverworkflow.WaitTermKindGeneric:
+			spec.Terms = append(spec.Terms, riverworkflow.WaitTerm(term.Name, term.Expr))
+		}
+	}
+	return &spec, state, nil
+}
+
+func updateJobWaitMetadata(ctx context.Context, exec prodriver.ProExecutor, schema string, jobID int64, wait *riverworkflow.Wait) error {
+	data, err := json.Marshal(map[string]any{riverworkflow.MetadataKeyWorkflowWait: wait})
+	if err != nil {
+		return err
+	}
+	return exec.WorkflowWaitUpdateMetadataByJobIDMany(ctx, &prodriver.WorkflowWaitUpdateMetadataByJobIDManyParams{JobIDs: []int64{jobID}, Schema: schema, WaitStates: [][]byte{data}})
+}
+
+func firstNonNilTime(a, b *time.Time) *time.Time {
+	if a != nil {
+		return a
+	}
+	return b
+}
+
+func matchingSignalCount(signals []*prodriver.WorkflowSignal, expr string) (int64, *int64) {
+	var matched int64
+	var lastID *int64
+	for _, signal := range signals {
+		if signal == nil {
+			continue
+		}
+		if evalSignalExpr(expr, signal) {
+			matched++
+			id := signal.ID
+			lastID = &id
+		}
+	}
+	return matched, lastID
+}
+
+func evalSignalExpr(expr string, signal *prodriver.WorkflowSignal) bool {
+	expr = strings.TrimSpace(expr)
+	if expr == "" || expr == "true" {
+		return true
+	}
+	for _, part := range strings.Split(expr, "&&") {
+		if !evalSignalClause(strings.TrimSpace(part), signal) {
+			return false
+		}
+	}
+	return true
+}
+
+func evalSignalClause(clause string, signal *prodriver.WorkflowSignal) bool {
+	clause = strings.TrimSpace(strings.TrimPrefix(clause, "s."))
+	if strings.Contains(clause, "==") {
+		parts := strings.SplitN(clause, "==", 2)
+		left := strings.TrimSpace(parts[0])
+		right := strings.Trim(strings.TrimSpace(parts[1]), "'`")
+		if strings.HasPrefix(left, "payload.") {
+			value := gjson.GetBytes(signal.Payload, strings.TrimPrefix(left, "payload.")).String()
+			switch right {
+			case "true":
+				return gjson.GetBytes(signal.Payload, strings.TrimPrefix(left, "payload.")).Bool()
+			case "false":
+				return !gjson.GetBytes(signal.Payload, strings.TrimPrefix(left, "payload.")).Bool()
+			default:
+				return value == right
+			}
+		}
+	}
+	if strings.Contains(clause, "!=") {
+		parts := strings.SplitN(clause, "!=", 2)
+		left := strings.TrimSpace(parts[0])
+		right := strings.Trim(strings.TrimSpace(parts[1]), "'`")
+		if strings.HasPrefix(left, "payload.") {
+			return gjson.GetBytes(signal.Payload, strings.TrimPrefix(left, "payload.")).String() != right
+		}
+	}
+	return false
+}
+
+func evalTopExpr(expr string, signalsByKey map[string][]*prodriver.WorkflowSignal, termResults map[string]bool) bool {
+	for _, orPart := range strings.Split(expr, "||") {
+		andOK := true
+		for _, andPart := range strings.Split(orPart, "&&") {
+			if !evalTopClause(strings.TrimSpace(andPart), signalsByKey, termResults) {
+				andOK = false
+				break
+			}
+		}
+		if andOK {
+			return true
+		}
+	}
+	return false
+}
+
+func evalTopClause(clause string, signalsByKey map[string][]*prodriver.WorkflowSignal, termResults map[string]bool) bool {
+	clause = strings.Trim(clause, " ()")
+	if clause == "true" {
+		return true
+	}
+	if ok, exists := termResults[clause]; exists {
+		return ok
+	}
+	if strings.HasPrefix(clause, `signals["`) && strings.Contains(clause, `"].exists`) {
+		key := strings.TrimPrefix(clause, `signals["`)
+		key = key[:strings.Index(key, `"]`)]
+		inner := clause[strings.LastIndex(clause, ",")+1:]
+		inner = strings.TrimSuffix(strings.TrimSpace(inner), ")")
+		for _, signal := range signalsByKey[key] {
+			if evalSignalExpr(inner, signal) {
+				return true
+			}
+		}
+		return false
+	}
+	if strings.HasPrefix(clause, "signals.") && strings.Contains(clause, ".IncludedCount > 0") {
+		key := strings.TrimPrefix(clause, "signals.")
+		key = strings.TrimSuffix(key, ".IncludedCount > 0")
+		return len(signalsByKey[key]) > 0
+	}
+	return false
+}
+
+func evalGenericExpr(expr string, signalsByKey map[string][]*prodriver.WorkflowSignal, termResults map[string]bool) bool {
+	return evalTopExpr(expr, signalsByKey, termResults)
+}
+
+func findTimer(timers []riverworkflow.Timer, name string) riverworkflow.Timer {
+	for _, timer := range timers {
+		if timer.Name() == name {
+			return timer
+		}
+	}
+	return riverworkflow.Timer{}
+}
+
+func timerSatisfied(timer riverworkflow.Timer, startedAt time.Time, now time.Time) (bool, *time.Time) {
+	if fireAt, ok := timer.FireAt(); ok {
+		return !now.Before(fireAt), &fireAt
+	}
+	if after, ok := timer.After(); ok {
+		fireAt := startedAt.Add(after)
+		return !now.Before(fireAt), &fireAt
+	}
+	return false, nil
+}
+
+func lastSignalID(signals []*prodriver.WorkflowSignal) *int64 {
+	var out *int64
+	for _, signal := range signals {
+		if signal == nil {
+			continue
+		}
+		id := signal.ID
+		if out == nil || id > *out {
+			out = &id
+		}
+	}
+	return out
+}
+
+func anySignal(signalsByKey map[string][]*prodriver.WorkflowSignal) bool {
+	for _, signals := range signalsByKey {
+		if len(signals) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 type QueueBundle struct {
@@ -487,6 +846,7 @@ type WorkflowSignalGetLatestForTaskOpts struct {
 	Attempt                *int
 	IncludeAfterResolution bool
 }
+type WorkflowSignalLatestForTaskOpts = WorkflowSignalGetLatestForTaskOpts
 type WorkflowSignalListForTaskParams struct {
 	Attempt                *int
 	CursorID               int64
@@ -512,6 +872,7 @@ type WorkflowSignalOpts struct {
 	IdempotencyKey string
 	Source         any
 }
+type WorkflowSignalEmitOpts = WorkflowSignalOpts
 type WorkflowSignalResult struct {
 	Attempt            int
 	CreatedAt          time.Time
@@ -521,6 +882,7 @@ type WorkflowSignalResult struct {
 	SkippedAsDuplicate bool
 	WorkflowID         string
 }
+type WorkflowSignalEmitResult = WorkflowSignalResult
 type WorkflowTaskPendingReason string
 
 const (
@@ -531,6 +893,7 @@ const (
 )
 
 type WorkflowTaskWaitDiagnosticsOpts struct{ SignalScanLimit int }
+type WorkflowWaitDiagnosticsOpts = WorkflowTaskWaitDiagnosticsOpts
 
 type WorkflowRetryStillActiveError struct{ WorkflowID string }
 
@@ -609,6 +972,7 @@ type workflowTaskDef struct {
 	insertOpts *river.InsertOpts
 	opts       *WorkflowTaskOpts
 }
+type WorkflowSignals[TTx any] struct{ workflow *WorkflowT[TTx] }
 type WorkflowT[TTx any] struct {
 	client   *Client[TTx]
 	opts     *WorkflowOpts
@@ -677,6 +1041,9 @@ func (w *WorkflowT[TTx]) Name() string {
 		return ""
 	}
 	return w.opts.Name
+}
+func (w *WorkflowT[TTx]) Signals() *WorkflowSignals[TTx] {
+	return &WorkflowSignals[TTx]{workflow: w}
 }
 func (w *WorkflowT[TTx]) Add(taskName string, args river.JobArgs, insertOpts *river.InsertOpts, opts *WorkflowTaskOpts) WorkflowTask {
 	task, err := w.AddSafely(taskName, args, insertOpts, opts)
@@ -1018,6 +1385,16 @@ func (w *WorkflowT[TTx]) Signal(ctx context.Context, key string, payload any, op
 	var zero TTx
 	return w.SignalTx(ctx, zero, key, payload, opts)
 }
+func (s *WorkflowSignals[TTx]) Emit(ctx context.Context, key string, payload any, opts *WorkflowSignalEmitOpts) (*WorkflowSignalEmitResult, error) {
+	var zero TTx
+	return s.EmitTx(ctx, zero, key, payload, opts)
+}
+func (s *WorkflowSignals[TTx]) EmitTx(ctx context.Context, tx TTx, key string, payload any, opts *WorkflowSignalEmitOpts) (*WorkflowSignalEmitResult, error) {
+	if s == nil || s.workflow == nil {
+		return nil, errors.New("riverpro: nil workflow signals")
+	}
+	return s.workflow.SignalTx(ctx, tx, key, payload, opts)
+}
 func (w *WorkflowT[TTx]) SignalTx(ctx context.Context, tx TTx, key string, payload any, opts *WorkflowSignalOpts) (*WorkflowSignalResult, error) {
 	if key == "" {
 		return nil, errors.New("riverpro: signal key is empty")
@@ -1049,11 +1426,28 @@ func (w *WorkflowT[TTx]) SignalTx(ctx context.Context, tx TTx, key string, paylo
 	if err != nil {
 		return nil, err
 	}
+	if !row.PayloadSemanticEqual {
+		return nil, &riverworkflow.SignalPayloadMismatchError{SignalID: &row.ID, WorkflowID: row.WorkflowID}
+	}
+	if opts != nil && opts.Attempt != nil && row.CurrentAttempt != 0 && *opts.Attempt != row.CurrentAttempt {
+		return nil, &riverworkflow.SignalAttemptMismatchError{RequestedAttempt: *opts.Attempt, SignalAttempt: row.CurrentAttempt, WorkflowID: row.WorkflowID}
+	}
+	_ = w.client.workflowEvaluateReady(ctx)
 	return &WorkflowSignalResult{Attempt: row.Attempt, CreatedAt: row.CreatedAt, ID: row.ID, IdempotencyKey: row.IdempotencyKey, Key: row.Key, SkippedAsDuplicate: row.SkippedAsDuplicate, WorkflowID: row.WorkflowID}, nil
 }
 func (w *WorkflowT[TTx]) SignalList(ctx context.Context, opts *WorkflowSignalListParams) (*WorkflowSignalListResult, error) {
 	var zero TTx
 	return w.SignalListTx(ctx, zero, opts)
+}
+func (s *WorkflowSignals[TTx]) List(ctx context.Context, opts *WorkflowSignalListParams) (*WorkflowSignalListResult, error) {
+	var zero TTx
+	return s.ListTx(ctx, zero, opts)
+}
+func (s *WorkflowSignals[TTx]) ListTx(ctx context.Context, tx TTx, opts *WorkflowSignalListParams) (*WorkflowSignalListResult, error) {
+	if s == nil || s.workflow == nil {
+		return nil, errors.New("riverpro: nil workflow signals")
+	}
+	return s.workflow.SignalListTx(ctx, tx, opts)
 }
 func (w *WorkflowT[TTx]) SignalListTx(ctx context.Context, tx TTx, opts *WorkflowSignalListParams) (*WorkflowSignalListResult, error) {
 	if w == nil || w.client == nil || w.client.proDriver == nil {
@@ -1091,6 +1485,16 @@ func (w *WorkflowT[TTx]) SignalListForTask(ctx context.Context, taskName string,
 	var zero TTx
 	return w.SignalListForTaskTx(ctx, zero, taskName, opts)
 }
+func (s *WorkflowSignals[TTx]) ListForTask(ctx context.Context, taskName string, opts *WorkflowSignalListForTaskParams) (*WorkflowSignalListResult, error) {
+	var zero TTx
+	return s.ListForTaskTx(ctx, zero, taskName, opts)
+}
+func (s *WorkflowSignals[TTx]) ListForTaskTx(ctx context.Context, tx TTx, taskName string, opts *WorkflowSignalListForTaskParams) (*WorkflowSignalListResult, error) {
+	if s == nil || s.workflow == nil {
+		return nil, errors.New("riverpro: nil workflow signals")
+	}
+	return s.workflow.SignalListForTaskTx(ctx, tx, taskName, opts)
+}
 func (w *WorkflowT[TTx]) SignalListForTaskTx(ctx context.Context, tx TTx, taskName string, opts *WorkflowSignalListForTaskParams) (*WorkflowSignalListResult, error) {
 	if taskName == "" {
 		return nil, errors.New("riverpro: task name is empty")
@@ -1098,14 +1502,46 @@ func (w *WorkflowT[TTx]) SignalListForTaskTx(ctx context.Context, tx TTx, taskNa
 	if w == nil || w.client == nil || w.client.proDriver == nil {
 		return nil, errors.New("riverpro: client is not configured with a Pro driver")
 	}
+	task, err := w.LoadTaskTx(ctx, tx, taskName)
+	if err != nil {
+		if errors.Is(err, rivertype.ErrNotFound) {
+			return nil, &riverworkflow.SignalUnknownTaskError{TaskName: taskName, WorkflowID: w.ID()}
+		}
+		return nil, err
+	}
+	if task.Wait == nil {
+		return nil, &riverworkflow.WaitTaskDeclaresNoWaitError{TaskName: taskName, WorkflowID: w.ID()}
+	}
+	var exec prodriver.ProExecutor = w.client.proDriver.GetProExecutor()
+	if !isZeroValue(tx) {
+		exec = w.client.proDriver.UnwrapProExecutor(tx)
+	}
+	declaredKeys := signalKeysFromWait(task.Wait)
+	if len(declaredKeys) == 0 {
+		return nil, &riverworkflow.SignalTaskDeclaresNoSignalKeysError{TaskName: taskName, WorkflowID: w.ID()}
+	}
 	var cursor *int64
-	var keys []string
+	keys := declaredKeys
+	attempt := optsTaskAttempt(opts)
+	if attempt == nil && task.Wait.Evidence != nil {
+		attempt = &task.Wait.Evidence.WorkflowAttempt
+	}
+	if attempt == nil {
+		workflow, err := exec.WorkflowGetByID(ctx, &prodriver.WorkflowGetByIDParams{Schema: w.client.config.Schema, WorkflowID: w.ID()})
+		if err != nil {
+			return nil, err
+		}
+		attempt = &workflow.CurrentAttempt
+	}
 	limit := 100
 	if opts != nil {
 		if opts.CursorID != 0 {
 			cursor = &opts.CursorID
 		}
 		if opts.Key != "" {
+			if !stringSliceContains(declaredKeys, opts.Key) {
+				return nil, &riverworkflow.SignalKeyUndeclaredError{Key: opts.Key, TaskName: taskName, WorkflowID: w.ID()}
+			}
 			keys = []string{opts.Key}
 		}
 		if opts.Limit > 0 {
@@ -1115,19 +1551,28 @@ func (w *WorkflowT[TTx]) SignalListForTaskTx(ctx context.Context, tx TTx, taskNa
 	if limit > 1000 {
 		limit = 1000
 	}
-	var exec prodriver.ProExecutor = w.client.proDriver.GetProExecutor()
-	if !isZeroValue(tx) {
-		exec = w.client.proDriver.UnwrapProExecutor(tx)
-	}
-	rows, err := exec.WorkflowSignalListByKeys(ctx, &prodriver.WorkflowSignalListByKeysParams{Attempt: optsTaskAttempt(opts), CursorID: cursor, Desc: opts != nil && opts.Desc, Keys: keys, LimitCount: limit, Schema: w.client.config.Schema, WorkflowID: w.ID()})
+	rows, err := exec.WorkflowSignalListByKeys(ctx, &prodriver.WorkflowSignalListByKeysParams{Attempt: attempt, CursorID: cursor, Desc: opts != nil && opts.Desc, Keys: keys, LimitCount: limit, Schema: w.client.config.Schema, WorkflowID: w.ID()})
 	if err != nil {
 		return nil, err
+	}
+	if opts == nil || !opts.IncludeAfterResolution {
+		rows = filterSignalsByWaitEvidence(rows, task.Wait)
 	}
 	return signalsToResult(rows, limit), nil
 }
 func (w *WorkflowT[TTx]) SignalGetLatestForTask(ctx context.Context, taskName, key string, opts *WorkflowSignalGetLatestForTaskOpts) (riverworkflow.Signal, error) {
 	var zero TTx
 	return w.SignalGetLatestForTaskTx(ctx, zero, taskName, key, opts)
+}
+func (s *WorkflowSignals[TTx]) LatestForTask(ctx context.Context, taskName string, key string, opts *WorkflowSignalLatestForTaskOpts) (riverworkflow.Signal, error) {
+	var zero TTx
+	return s.LatestForTaskTx(ctx, zero, taskName, key, opts)
+}
+func (s *WorkflowSignals[TTx]) LatestForTaskTx(ctx context.Context, tx TTx, taskName string, key string, opts *WorkflowSignalLatestForTaskOpts) (riverworkflow.Signal, error) {
+	if s == nil || s.workflow == nil {
+		return riverworkflow.Signal{}, errors.New("riverpro: nil workflow signals")
+	}
+	return s.workflow.SignalGetLatestForTaskTx(ctx, tx, taskName, key, opts)
 }
 func (w *WorkflowT[TTx]) SignalGetLatestForTaskTx(ctx context.Context, tx TTx, taskName, key string, opts *WorkflowSignalGetLatestForTaskOpts) (riverworkflow.Signal, error) {
 	if key == "" {
@@ -1146,9 +1591,14 @@ func (w *WorkflowT[TTx]) TaskWaitDiagnostics(ctx context.Context, taskName strin
 	var zero TTx
 	return w.TaskWaitDiagnosticsTx(ctx, zero, taskName, opts)
 }
+func (w *WorkflowT[TTx]) WaitDiagnostics(ctx context.Context, taskName string, opts *WorkflowWaitDiagnosticsOpts) (*riverworkflow.WaitDiagnostics, error) {
+	var zero TTx
+	return w.WaitDiagnosticsTx(ctx, zero, taskName, opts)
+}
+func (w *WorkflowT[TTx]) WaitDiagnosticsTx(ctx context.Context, tx TTx, taskName string, opts *WorkflowWaitDiagnosticsOpts) (*riverworkflow.WaitDiagnostics, error) {
+	return w.TaskWaitDiagnosticsTx(ctx, tx, taskName, opts)
+}
 func (w *WorkflowT[TTx]) TaskWaitDiagnosticsTx(ctx context.Context, tx TTx, taskName string, opts *WorkflowTaskWaitDiagnosticsOpts) (*riverworkflow.WaitDiagnostics, error) {
-	_ = ctx
-	_ = tx
 	if opts != nil && opts.SignalScanLimit > 100000 {
 		return nil, errors.New("riverpro: SignalScanLimit must be <= 100000")
 	}
@@ -1159,7 +1609,68 @@ func (w *WorkflowT[TTx]) TaskWaitDiagnosticsTx(ctx context.Context, tx TTx, task
 	if task.Wait == nil {
 		return nil, &riverworkflow.WaitTaskDeclaresNoWaitError{TaskName: taskName, WorkflowID: w.ID()}
 	}
-	return &riverworkflow.WaitDiagnostics{InspectedAt: time.Now().UTC(), Phase: task.Wait.Phase}, nil
+	limit := 10000
+	if opts != nil && opts.SignalScanLimit > 0 {
+		limit = opts.SignalScanLimit
+	}
+	if w == nil || w.client == nil || w.client.proDriver == nil {
+		return &riverworkflow.WaitDiagnostics{InspectedAt: time.Now().UTC(), Phase: task.Wait.Phase, SignalScanLimit: limit}, nil
+	}
+	var exec prodriver.ProExecutor = w.client.proDriver.GetProExecutor()
+	if !isZeroValue(tx) {
+		exec = w.client.proDriver.UnwrapProExecutor(tx)
+	}
+	spec, _, err := waitSpecAndStateFromMetadata(task.Job.Metadata)
+	if err != nil || spec == nil {
+		return &riverworkflow.WaitDiagnostics{InspectedAt: time.Now().UTC(), Phase: task.Wait.Phase, SignalScanLimit: limit}, err
+	}
+	workflow, err := exec.WorkflowGetByID(ctx, &prodriver.WorkflowGetByIDParams{Schema: w.client.config.Schema, WorkflowID: w.ID()})
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	startedAt := now
+	if task.Wait.StartedAt != nil {
+		startedAt = *task.Wait.StartedAt
+	}
+	resolved, wait, err := w.client.evaluateWait(ctx, exec, w.ID(), workflow.CurrentAttempt, taskName, spec, startedAt, now)
+	if err != nil {
+		return nil, err
+	}
+	termDiagnostics := make([]riverworkflow.WaitTermDiagnostic, 0, len(wait.Terms))
+	for _, term := range wait.Terms {
+		d := riverworkflow.WaitTermDiagnostic{Name: term.Name, RequiredCount: term.RequiredCount}
+		if term.Result != nil {
+			d.LastMatchedID = term.Result.LastMatchedID
+			d.MatchedCount = term.Result.MatchedCount
+			d.Satisfied = term.Result.Satisfied
+		}
+		termDiagnostics = append(termDiagnostics, d)
+	}
+	signalDiagnostics := make([]riverworkflow.WaitSignalDiagnostic, 0, len(wait.Inputs.Signals))
+	var signalCount int
+	for _, signal := range wait.Inputs.Signals {
+		d := riverworkflow.WaitSignalDiagnostic{Key: signal.Key}
+		if signal.Result != nil {
+			d.IncludedCount = signal.Result.IncludedCount
+			d.LastID = signal.Result.LastIncludedID
+			signalCount += int(signal.Result.IncludedCount)
+		}
+		signalDiagnostics = append(signalDiagnostics, d)
+	}
+	timerDiagnostics := make([]riverworkflow.WaitTimerDiagnostic, 0, len(wait.Inputs.Timers))
+	for _, timer := range wait.Inputs.Timers {
+		d := riverworkflow.WaitTimerDiagnostic{Name: timer.Name, FireAt: timer.FireAt}
+		if timer.Result != nil {
+			d.Fired = timer.Result.Fired
+		}
+		timerDiagnostics = append(timerDiagnostics, d)
+	}
+	phase := task.Wait.Phase
+	if resolved {
+		phase = riverworkflow.WaitPhaseResolved
+	}
+	return &riverworkflow.WaitDiagnostics{ExprResult: &resolved, Inputs: riverworkflow.WaitDiagnosticsInputs{Signals: signalDiagnostics, Timers: timerDiagnostics}, InspectedAt: now, Phase: phase, SignalScanCount: signalCount, SignalScanLimit: limit, Terms: termDiagnostics, Truncated: signalCount >= limit, WorkflowAttempt: workflow.CurrentAttempt}, nil
 }
 
 func isZeroValue[T any](v T) bool {
@@ -1183,6 +1694,59 @@ func optsLatestAttempt(opts *WorkflowSignalGetLatestForTaskOpts) *int {
 		return nil
 	}
 	return opts.Attempt
+}
+func signalKeysFromWait(wait *riverworkflow.Wait) []string {
+	if wait == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	keys := make([]string, 0, len(wait.Inputs.Signals))
+	for _, signal := range wait.Inputs.Signals {
+		if signal.Key != "" && !seen[signal.Key] {
+			seen[signal.Key] = true
+			keys = append(keys, signal.Key)
+		}
+	}
+	for _, term := range wait.Terms {
+		if term.SignalKey != "" && !seen[term.SignalKey] {
+			seen[term.SignalKey] = true
+			keys = append(keys, term.SignalKey)
+		}
+	}
+	return keys
+}
+func filterSignalsByWaitEvidence(rows []*prodriver.WorkflowSignal, wait *riverworkflow.Wait) []*prodriver.WorkflowSignal {
+	if wait == nil || wait.Evidence == nil {
+		return rows
+	}
+	lastByKey := map[string]int64{}
+	for _, signal := range wait.Inputs.Signals {
+		if signal.Result != nil && signal.Result.LastIncludedID != nil {
+			lastByKey[signal.Key] = *signal.Result.LastIncludedID
+		}
+	}
+	if len(lastByKey) == 0 {
+		return rows
+	}
+	filtered := rows[:0]
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		if last, ok := lastByKey[row.Key]; ok && row.ID > last {
+			continue
+		}
+		filtered = append(filtered, row)
+	}
+	return filtered
+}
+func stringSliceContains(values []string, value string) bool {
+	for _, v := range values {
+		if v == value {
+			return true
+		}
+	}
+	return false
 }
 func marshalJSONObjectOrValue(v any) ([]byte, error) {
 	if v == nil {
