@@ -1,0 +1,25 @@
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 10
+    groups:
+      riverqueue:
+        patterns:
+          - "github.com/riverqueue/*"
+        update-types:
+          - "minor"
+          - "patch"
+      jackc:
+        patterns:
+          - "github.com/jackc/*"
+        update-types:
+          - "minor"
+          - "patch"
