@@ -20,9 +20,10 @@ import (
 )
 
 const (
-	metadataKeyBatchKey    = "riverpro_batch_key"
-	metadataKeyEphemeral   = "riverpro_ephemeral"
-	metadataKeySequenceKey = "riverpro_sequence_key"
+	metadataKeyBatchKey       = "riverpro_batch_key"
+	metadataKeyEphemeral      = "riverpro_ephemeral"
+	metadataKeySequenceKey    = "riverpro_sequence_key"
+	producerShutdownTimeout   = 5 * time.Second
 )
 
 type proPilot[TTx any] struct {
@@ -175,7 +176,18 @@ func (p *proPilot[TTx]) ProducerKeepAlive(ctx context.Context, exec riverdriver.
 }
 
 func (p *proPilot[TTx]) ProducerShutdown(ctx context.Context, exec riverdriver.Executor, params *riverpilot.ProducerShutdownParams) error {
-	return (&prodriver.Executor{Executor: exec}).ProducerDelete(ctx, &prodriver.ProducerDeleteParams{ID: params.ProducerID, Schema: params.Schema})
+	// River starts producer cleanup with very small retry deadlines (100ms,
+	// 500ms, ...). A brief PostgreSQL lock can therefore emit noisy errors even
+	// though cleanup succeeds on a later attempt. Producer removal is a bounded
+	// shutdown operation, so give it one realistic budget independent of those
+	// per-attempt deadlines.
+	cleanupCtx, cancel := producerShutdownContext(ctx)
+	defer cancel()
+	return (&prodriver.Executor{Executor: exec}).ProducerDelete(cleanupCtx, &prodriver.ProducerDeleteParams{ID: params.ProducerID, Schema: params.Schema})
+}
+
+func producerShutdownContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), producerShutdownTimeout)
 }
 
 type proProducerState struct{}
