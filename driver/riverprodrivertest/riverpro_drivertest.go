@@ -66,6 +66,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 	t.Helper()
 
 	exerciseMigration(ctx, t, driverWithSchema)
+	exerciseFastInsertMethods(ctx, t, executorWithTx)
 	exercisePeriodicJobs(ctx, t, executorWithTx)
 	exerciseProducers(ctx, t, executorWithTx)
 	exerciseSequences(ctx, t, executorWithTx)
@@ -76,6 +77,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 	exerciseWorkflowTimers(ctx, t, executorWithTx)
 	exerciseWorkflowWorklists(ctx, t, executorWithTx)
 	exerciseConcurrencyLimits(ctx, t, executorWithTx)
+	exerciseConcurrencyLocalLimitRace(ctx, t, driverWithSchema)
 	exerciseDocumentedExecutorAPI(ctx, t, executorWithTx)
 }
 
@@ -138,6 +140,65 @@ func exerciseMigration[TTx any](ctx context.Context, t *testing.T,
 		} {
 			requireTableExists(ctx, t, exec, schema, table)
 		}
+	})
+}
+
+func exerciseFastInsertMethods[TTx any](ctx context.Context, t *testing.T,
+	executorWithTx func(ctx context.Context, t *testing.T) (driver.ProExecutor, driver.ProDriver[TTx]),
+) {
+	t.Helper()
+	t.Run("FastInsertMethods", func(t *testing.T) {
+		t.Parallel()
+		exec, schema := execSchema(ctx, t, executorWithTx)
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		later := now.Add(10 * time.Minute)
+
+		makeJob := func(kind string, state rivertype.JobState, priority int) *riverdriver.JobInsertFastParams {
+			return &riverdriver.JobInsertFastParams{
+				CreatedAt:   &now,
+				EncodedArgs: []byte(`{"kind":"` + kind + `"}`),
+				Kind:        kind,
+				MaxAttempts: 3,
+				Metadata:    []byte(`{"source":"fast-insert-test"}`),
+				Priority:    priority,
+				Queue:       "default",
+				ScheduledAt: &later,
+				State:       state,
+				Tags:        []string{"fast", kind},
+			}
+		}
+
+		inserted, err := exec.JobInsertFastMany(ctx, &riverdriver.JobInsertFastManyParams{
+			Schema: schema,
+			Jobs: []*riverdriver.JobInsertFastParams{
+				makeJob("fast-return-a", rivertype.JobStateAvailable, 1),
+				makeJob("fast-return-b", rivertype.JobStateScheduled, 2),
+			},
+		})
+		require.NoError(t, err)
+		require.Len(t, inserted, 2)
+		require.False(t, inserted[0].UniqueSkippedAsDuplicate)
+		require.NotNil(t, inserted[0].Job)
+		require.Equal(t, "fast-return-a", inserted[0].Job.Kind)
+		require.Equal(t, rivertype.JobStateAvailable, inserted[0].Job.State)
+		require.Equal(t, []string{"fast", "fast-return-a"}, inserted[0].Job.Tags)
+
+		count, err := exec.JobInsertFastManyNoReturning(ctx, &riverdriver.JobInsertFastManyParams{
+			Schema: schema,
+			Jobs: []*riverdriver.JobInsertFastParams{
+				makeJob("fast-no-return-a", rivertype.JobStateAvailable, 3),
+				makeJob("fast-no-return-b", rivertype.JobStateScheduled, 4),
+			},
+		})
+		require.NoError(t, err)
+		require.Equal(t, 2, count)
+
+		var persisted int
+		require.NoError(t, exec.QueryRow(ctx, fmt.Sprintf(`
+			SELECT count(*) FROM %s
+			WHERE kind = ANY($1::text[]) AND metadata @> $2::jsonb
+		`, qname(schema, "river_job")), []string{"fast-return-a", "fast-return-b", "fast-no-return-a", "fast-no-return-b"}, []byte(`{"source":"fast-insert-test"}`)).Scan(&persisted))
+		require.Equal(t, 4, persisted)
 	})
 }
 
@@ -779,6 +840,91 @@ func exerciseConcurrencyLimits[TTx any](ctx context.Context, t *testing.T,
 	})
 }
 
+func exerciseConcurrencyLocalLimitRace[TTx any](ctx context.Context, t *testing.T,
+	driverWithSchema func(ctx context.Context, t *testing.T, opts *riverdbtest.TestSchemaOpts) (driver.ProDriver[TTx], string),
+) {
+	t.Helper()
+	t.Run("ConcurrencyLocalLimitWithoutGlobalDoesNotDoubleClaim", func(t *testing.T) {
+		t.Parallel()
+		d, schema := driverWithSchema(ctx, t, nil)
+		RequireProDriver(t, d)
+		exec := d.GetProExecutor()
+		available := insertJob(ctx, t, exec, schema, "race-kind", rivertype.JobStateAvailable, []byte(`{}`), []byte(`{}`), nil)
+
+		fetchParams := func(clientID string) *driver.JobGetAvailableLimitedParams {
+			now := time.Now().UTC().Add(time.Second)
+			return &driver.JobGetAvailableLimitedParams{
+				JobGetAvailableParams: &riverdriver.JobGetAvailableParams{
+					ClientID:       clientID,
+					MaxAttemptedBy: 8,
+					MaxToLock:      1,
+					Now:            &now,
+					Queue:          "default",
+					Schema:         schema,
+				},
+				LocalLimit:      1,
+				PartitionByKind: true,
+			}
+		}
+
+		tx1, err := exec.BeginPro(ctx)
+		require.NoError(t, err)
+		tx1Done := false
+		defer func() {
+			if !tx1Done {
+				_ = tx1.Rollback(ctx)
+			}
+		}()
+
+		first, err := tx1.JobGetAvailableLimited(ctx, fetchParams("client-race-a"))
+		require.NoError(t, err)
+		require.Len(t, first, 1)
+		require.Equal(t, available.ID, first[0].ID)
+
+		tx2, err := exec.BeginPro(ctx)
+		require.NoError(t, err)
+		tx2Done := false
+		defer func() {
+			if !tx2Done {
+				_ = tx2.Rollback(ctx)
+			}
+		}()
+
+		type fetchResult struct {
+			jobs []*rivertype.JobRow
+			err  error
+		}
+		results := make(chan fetchResult, 1)
+		go func() {
+			jobs, err := tx2.JobGetAvailableLimited(ctx, fetchParams("client-race-b"))
+			results <- fetchResult{jobs: jobs, err: err}
+		}()
+
+		select {
+		case result := <-results:
+			require.NoError(t, result.err)
+			require.NotContains(t, jobIDs(result.jobs), available.ID)
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		require.NoError(t, tx1.Commit(ctx))
+		tx1Done = true
+
+		var second fetchResult
+		select {
+		case second = <-results:
+		case <-time.After(5 * time.Second):
+			t.Fatal("second local-limit fetch did not finish after first transaction committed")
+		}
+		require.NoError(t, second.err)
+		require.NotContains(t, jobIDs(second.jobs), available.ID)
+		require.Empty(t, second.jobs)
+
+		require.NoError(t, tx2.Rollback(ctx))
+		tx2Done = true
+	})
+}
+
 func exerciseDocumentedExecutorAPI[TTx any](ctx context.Context, t *testing.T,
 	executorWithTx func(ctx context.Context, t *testing.T) (driver.ProExecutor, driver.ProDriver[TTx]),
 ) {
@@ -948,6 +1094,9 @@ func exerciseDocumentedExecutorAPI[TTx any](ctx context.Context, t *testing.T,
 		finalIDs, err := exec.WorkflowCleanupListFinalizedIDs(ctx, &driver.WorkflowCleanupListFinalizedIDsParams{FinalizedBefore: now.Add(time.Second), LimitCount: 10, Schema: schema, State: "completed"})
 		require.NoError(t, err)
 		require.Contains(t, finalIDs, "wf-api-final")
+		withoutJobs, err := exec.WorkflowCleanupListFinalizedIDsWithoutJobs(ctx, &driver.WorkflowCleanupListFinalizedIDsWithoutJobsParams{LimitCount: 10, Schema: schema, State: "completed"})
+		require.NoError(t, err)
+		require.Contains(t, withoutJobs, "wf-api-final")
 		candidates, err := exec.WorkflowGetFinalizationCandidates(ctx, &driver.WorkflowGetFinalizationCandidatesParams{LimitCount: 10, Schema: schema})
 		require.NoError(t, err)
 		require.NotNil(t, candidates)
@@ -1029,6 +1178,16 @@ func insertWorkflowJob(ctx context.Context, t *testing.T, exec driver.ProExecuto
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }
+
+func jobIDs(jobs []*rivertype.JobRow) []int64 {
+	out := make([]int64, 0, len(jobs))
+	for _, job := range jobs {
+		if job != nil {
+			out = append(out, job.ID)
+		}
+	}
+	return out
+}
 
 func periodicIDs(jobs []*driver.PeriodicJob) []string {
 	ids := make([]string, 0, len(jobs))

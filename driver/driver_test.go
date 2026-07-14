@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"testing"
 	"time"
@@ -97,4 +98,71 @@ func TestCompatibilityPeriodicAndSignalStore(t *testing.T) {
 	if len(listed) != 1 || listed[0].Key != "ready" {
 		t.Fatalf("unexpected signals: %#v", listed)
 	}
+}
+
+func TestWrapperNilAndPluginHelpers(t *testing.T) {
+	var nilWrapper *Wrapper[any]
+	if nilWrapper.HasPool() {
+		t.Fatal("nil wrapper should not report a pool")
+	}
+	if nilWrapper.PluginPilot() != nil {
+		t.Fatal("nil wrapper should not expose a plugin pilot")
+	}
+	if got := nilWrapper.GetProExecutor(); got == nil {
+		t.Fatal("nil wrapper should return a non-nil compatibility pro executor")
+	}
+	if got := nilWrapper.GetExecutor(); got == nil {
+		t.Fatal("nil wrapper should return a non-nil compatibility executor")
+	}
+	if got := nilWrapper.UnwrapProExecutor(nil); got == nil {
+		t.Fatal("nil wrapper should return a non-nil compatibility tx executor")
+	}
+	if got := nilWrapper.UnwrapExecutor(nil); got == nil {
+		t.Fatal("nil wrapper should return a non-nil compatibility river tx executor")
+	}
+	if got := nilWrapper.UnwrapTx(nil); got != nil {
+		t.Fatalf("nil wrapper should return zero tx, got %#v", got)
+	}
+	if got := nilWrapper.GetMigrationLines(); len(got) != 1 || got[0] != MigrationLinePro {
+		t.Fatalf("nil wrapper migration lines = %#v", got)
+	}
+	if got := nilWrapper.GetMigrationDefaultLines(); len(got) != 1 || got[0] != MigrationLinePro {
+		t.Fatalf("nil wrapper default migration lines = %#v", got)
+	}
+	if nilWrapper.GetMigrationFS("main") != nil {
+		t.Fatal("nil wrapper should not expose base migration FS")
+	}
+	if got := nilWrapper.GetMigrationTruncateTables(MigrationLinePro, 0); len(got) == 0 {
+		t.Fatal("nil wrapper should expose pro truncate tables")
+	}
+
+	w := NewWrapper[any](nil)
+	w.PluginInit(nil)
+	w.ProConfigInit(nil)
+	if w.PluginPilot() != nil {
+		t.Fatal("nil pilot should round-trip as nil")
+	}
+}
+
+func TestDriverPublicErrorCompatibility(t *testing.T) {
+	if !errors.Is(&DeadlockError{}, ErrDeadlock) {
+		t.Fatal("DeadlockError should match ErrDeadlock")
+	}
+	if !errors.Is(&StatementTimeoutError{}, ErrStatementTimeout) {
+		t.Fatal("StatementTimeoutError should match ErrStatementTimeout")
+	}
+	if !errors.Is(&UniqueViolationError{}, &UniqueViolationError{}) {
+		t.Fatal("UniqueViolationError should match ErrUniqueViolation")
+	}
+	if got := MigrationLineProTruncateTables(MigrationLinePro, 0); len(got) == 0 {
+		t.Fatal("expected pro truncate tables")
+	}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected unknown migration line to panic")
+			}
+		}()
+		_ = MigrationLineProTruncateTables("main", 0)
+	}()
 }

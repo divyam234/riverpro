@@ -108,6 +108,7 @@ type ProExecutor interface {
 	WorkflowCleanupDeleteWorkflowsByWorkflowIDs(ctx context.Context, params *WorkflowCleanupDeleteWorkflowsByWorkflowIDsParams) error
 	WorkflowCleanupDeleteWorklistByWorkflowIDs(ctx context.Context, params *WorkflowCleanupDeleteByWorkflowIDsParams) error
 	WorkflowCleanupListFinalizedIDs(ctx context.Context, params *WorkflowCleanupListFinalizedIDsParams) ([]string, error)
+	WorkflowCleanupListFinalizedIDsWithoutJobs(ctx context.Context, params *WorkflowCleanupListFinalizedIDsWithoutJobsParams) ([]string, error)
 	WorkflowCountIncompleteJobs(ctx context.Context, params *WorkflowCountIncompleteJobsParams) (int64, error)
 	WorkflowFinalizeIfCompleteMany(ctx context.Context, params *WorkflowFinalizeIfCompleteManyParams) ([]string, error)
 	WorkflowGetByID(ctx context.Context, params *WorkflowGetByIDParams) (*Workflow, error)
@@ -646,6 +647,13 @@ type WorkflowCleanupListFinalizedIDsParams struct {
 	LimitCount      int
 	Schema          string
 	State           string
+}
+
+// WorkflowCleanupListFinalizedIDsWithoutJobsParams
+type WorkflowCleanupListFinalizedIDsWithoutJobsParams struct {
+	LimitCount int
+	Schema     string
+	State      string
 }
 
 // WorkflowCountIncompleteJobsParams
@@ -1444,24 +1452,24 @@ func periodicJobCronTimezoneDefault(tz string) string {
 	return tz
 }
 
-// periodicJobInsertArgs builds the positional argument list for a
+// periodicJobUpsertArgs builds the positional argument list for a
 // PeriodicJobUpsert statement. Order MUST match the column list in the
 // INSERT SQL: id, next_run_at, updated_at, kind, args, queue, priority,
 // max_attempts, tags, cron_expression, cron_timezone.
-func periodicJobInsertArgs(now time.Time, params *PeriodicJobUpsertParams) ([]any, string) {
+func periodicJobUpsertArgs(now time.Time, params *PeriodicJobUpsertParams) ([]any, string) {
 	if params.Kind == "" {
 		return nil, "riverpro driver: periodic job kind must be non-empty"
 	}
 	args := []any{
-		params.ID,                 // 1: id
-		params.NextRunAt,          // 2: next_run_at
-		now,                       // 3: updated_at
-		params.Kind,               // 4: kind
-		nullableJSONBytes(params.Args), // 5: args
+		params.ID,                             // 1: id
+		params.NextRunAt,                      // 2: next_run_at
+		now,                                   // 3: updated_at
+		params.Kind,                           // 4: kind
+		nullableJSONBytes(params.Args),        // 5: args
 		periodicJobQueueDefault(params.Queue), // 6: queue (filled by caller)
-		params.Priority,           // 7: priority
-		params.MaxAttempts,        // 8: max_attempts
-		nonNilTags(params.Tags),   // 9: tags
+		params.Priority,                       // 7: priority
+		params.MaxAttempts,                    // 8: max_attempts
+		nonNilTags(params.Tags),               // 9: tags
 	}
 	if params.CronExpression == nil {
 		args = append(args, nil) // 10: cron_expression
@@ -1851,6 +1859,9 @@ WITH available_partitions AS MATERIALIZED (
 	    )
 	FROM locked_jobs
 	WHERE j.id = locked_jobs.id
+	  AND j.state = 'available'::%[3]s
+	  AND j.queue = $1
+	  AND j.scheduled_at <= $2
 	RETURNING j.*
 )
 SELECT coalesce(json_agg(%[5]s ORDER BY j.priority ASC, j.scheduled_at ASC, j.id ASC), '[]'::json)
@@ -2184,6 +2195,7 @@ func (e *Executor) PeriodicJobGetByID(ctx context.Context, params *PeriodicJobGe
 	}
 	return nil, rivertype.ErrNotFound
 }
+
 // PeriodicJobUpsert inserts or updates a durable periodic job. The
 // single method handles all writes: initial insert, schedule change,
 // pause, and resume. To pause: pass Paused=true. To resume: pass
@@ -2199,11 +2211,11 @@ func (e *Executor) PeriodicJobUpsert(ctx context.Context, params *PeriodicJobUps
 	}
 	if dbAvailable(e) {
 		cronTz := periodicJobCronTimezoneDefault(params.CronTimezone)
-		args, errMsg := periodicJobInsertArgs(now, params)
+		args, errMsg := periodicJobUpsertArgs(now, params)
 		if errMsg != "" {
 			return nil, errors.New(errMsg)
 		}
-		args = append(args, cronTz) // 11: cron_timezone
+		args = append(args, cronTz)        // 11: cron_timezone
 		args = append(args, params.Paused) // 12: paused bool
 		// pg_notify runs in the same statement as the UPSERT, so the
 		// notification is rolled back if the change is rolled back.
@@ -3396,6 +3408,50 @@ func (e *Executor) WorkflowCleanupListFinalizedIDs(ctx context.Context, params *
 	}
 	return out, nil
 }
+
+func (e *Executor) WorkflowCleanupListFinalizedIDsWithoutJobs(ctx context.Context, params *WorkflowCleanupListFinalizedIDsWithoutJobsParams) ([]string, error) {
+	schema := ""
+	max := 100
+	state := ""
+	if params != nil {
+		schema = params.Schema
+		max = limitDefault(params.LimitCount, max)
+		state = params.State
+	}
+	if dbAvailable(e) {
+		return scanJSON[[]string](ctx, e.Executor, fmt.Sprintf(`
+			SELECT coalesce(json_agg(id ORDER BY id), '[]'::json)
+			FROM (
+				SELECT w.id
+				FROM %[1]s AS w
+				WHERE w.finalized_at IS NOT NULL
+				  AND ($1::text = '' OR w.state = $1)
+				  AND NOT EXISTS (
+					SELECT 1 FROM %[2]s AS j WHERE j.metadata ->> 'workflow_id' = w.id
+				  )
+				  AND NOT EXISTS (
+					SELECT 1 FROM %[3]s AS j WHERE j.metadata ->> 'workflow_id' = w.id
+				  )
+				ORDER BY w.id
+				LIMIT $2
+			) w
+		`, qt(schema, "river_workflow"), qt(schema, "river_job"), qt(schema, "river_job_dead_letter")), state, max)
+	}
+	compat.Lock()
+	defer compat.Unlock()
+	out := []string{}
+	for id, w := range compat.workflows[schema] {
+		if w.FinalizedAt != nil && (state == "" || w.State == state) {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	if len(out) > max {
+		out = out[:max]
+	}
+	return out, nil
+}
+
 func (e *Executor) WorkflowCountIncompleteJobs(ctx context.Context, params *WorkflowCountIncompleteJobsParams) (int64, error) {
 	if params == nil {
 		return 0, nil

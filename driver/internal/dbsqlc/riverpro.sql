@@ -161,11 +161,6 @@ LIMIT @max::integer;
 -- name: PeriodicJobGetByID :one
 SELECT * FROM /* TEMPLATE: schema */river_periodic_job WHERE id = @id;
 
--- name: PeriodicJobInsert :one
-INSERT INTO /* TEMPLATE: schema */river_periodic_job(id, next_run_at, updated_at)
-VALUES (@id, @next_run_at, coalesce(sqlc.narg(updated_at)::timestamptz, now()))
-RETURNING *;
-
 -- name: PeriodicJobKeepAliveAndReap :many
 WITH keepalive AS (
     UPDATE /* TEMPLATE: schema */river_periodic_job

@@ -645,30 +645,6 @@ func (q *Queries) PeriodicJobGetByID(ctx context.Context, db DBTX, id string) (*
 	return &i, err
 }
 
-const periodicJobInsert = `-- name: PeriodicJobInsert :one
-INSERT INTO /* TEMPLATE: schema */river_periodic_job(id, next_run_at, updated_at)
-VALUES ($1, $2, coalesce($3::timestamptz, now()))
-RETURNING id, created_at, next_run_at, updated_at
-`
-
-type PeriodicJobInsertParams struct {
-	ID        string
-	NextRunAt pgtype.Timestamptz
-	UpdatedAt pgtype.Timestamptz
-}
-
-func (q *Queries) PeriodicJobInsert(ctx context.Context, db DBTX, arg *PeriodicJobInsertParams) (*RiverPeriodicJob, error) {
-	row := db.QueryRow(ctx, periodicJobInsert, arg.ID, arg.NextRunAt, arg.UpdatedAt)
-	var i RiverPeriodicJob
-	err := row.Scan(
-		&i.ID,
-		&i.CreatedAt,
-		&i.NextRunAt,
-		&i.UpdatedAt,
-	)
-	return &i, err
-}
-
 const periodicJobKeepAliveAndReap = `-- name: PeriodicJobKeepAliveAndReap :many
 WITH keepalive AS (
     UPDATE /* TEMPLATE: schema */river_periodic_job

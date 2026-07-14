@@ -8,11 +8,19 @@ import (
 	"time"
 
 	"github.com/divyam234/riverpro/riverworkflow"
+	"github.com/riverqueue/river"
 )
 
 type testArgs struct{ KindValue string }
 
 func (a testArgs) Kind() string { return a.KindValue }
+
+type ephemeralTestArgs struct{}
+
+func (ephemeralTestArgs) Kind() string                 { return "ephemeral-test" }
+func (ephemeralTestArgs) EphemeralOpts() EphemeralOpts { return EphemeralOpts{} }
+
+var _ JobArgsWithEphemeralOpts = ephemeralTestArgs{}
 
 func TestWorkflowPrepareMetadataAndPending(t *testing.T) {
 	w := NewWorkflow(&WorkflowOpts{ID: "wf-id", Name: "wf-name"})
@@ -164,5 +172,72 @@ func TestWorkflowWaitDiagnosticsPublicAPI(t *testing.T) {
 	_, err := workflow.WaitDiagnostics(context.Background(), "approve_order", &WorkflowWaitDiagnosticsOpts{SignalScanLimit: 10})
 	if err == nil {
 		t.Fatal("expected WaitDiagnostics to require a configured workflow task")
+	}
+}
+
+func TestClientContextHelpersAndNilSafety(t *testing.T) {
+	ctx := context.Background()
+	if got, err := ClientFromContextSafely[any](ctx); err == nil || got != nil {
+		t.Fatalf("expected missing client error, got client=%#v err=%v", got, err)
+	}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("ClientFromContext should panic when no client is in context")
+			}
+		}()
+		_ = ClientFromContext[any](ctx)
+	}()
+
+	var nilClient *Client[any]
+	if nilClient.ProExecutor() != nil {
+		t.Fatal("nil client should not expose a pro executor")
+	}
+	if nilClient.Schema() != "" {
+		t.Fatalf("nil client schema should be empty, got %q", nilClient.Schema())
+	}
+	if nilClient.Queues() != nil {
+		t.Fatal("nil client queues should be nil")
+	}
+	if err := nilClient.Start(ctx); err == nil {
+		t.Fatal("nil client Start should return an error")
+	}
+}
+
+func TestClientContextRoundTripAndSmallHelpers(t *testing.T) {
+	client := &Client[any]{config: &Config{Config: river.Config{Schema: "schema-a"}}}
+	ctx := ContextWithClient(context.Background(), client)
+	got, err := ClientFromContextSafely[any](ctx)
+	if err != nil {
+		t.Fatalf("ClientFromContextSafely: %v", err)
+	}
+	if got != client || ClientFromContext[any](ctx) != client {
+		t.Fatal("client context round trip returned the wrong client")
+	}
+	if client.Schema() != "schema-a" {
+		t.Fatalf("unexpected schema: %q", client.Schema())
+	}
+
+	names := ReindexerIndexNamesDefault()
+	want := []string{"river_job_kind", "river_job_queue", "river_job_state_and_finalized_at", "river_job_workflow"}
+	if len(names) != len(want) {
+		t.Fatalf("unexpected reindexer names: %#v", names)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("unexpected reindexer names: %#v", names)
+		}
+	}
+	names[0] = "mutated"
+	if ReindexerIndexNamesDefault()[0] != "river_job_kind" {
+		t.Fatal("ReindexerIndexNamesDefault should return a fresh slice")
+	}
+
+	missingOutput := &TaskHasNoOutputError{JobID: 12, TaskName: "task-a", WorkflowID: "wf-a"}
+	if !errors.Is(missingOutput, &TaskHasNoOutputError{}) {
+		t.Fatal("TaskHasNoOutputError should support errors.Is")
+	}
+	if missingOutput.Error() != `riverpro: workflow task "task-a" has no output` {
+		t.Fatalf("unexpected TaskHasNoOutputError message: %q", missingOutput.Error())
 	}
 }
