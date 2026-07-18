@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,10 @@ var proMigrationFS embed.FS
 // configuration flag and called while that flag is disabled. Clients should
 // use errors.Is to detect it.
 var ErrNotSupported = errors.New("riverpro driver: feature is not supported with current configuration")
+
+// ErrPeriodicJobAlreadyExists is returned by create-only periodic job inserts
+// when the requested ID is already present.
+var ErrPeriodicJobAlreadyExists = errors.New("riverpro driver: periodic job already exists")
 
 func migrationFSForLine(line string) fs.FS {
 	if line != MigrationLinePro {
@@ -73,7 +78,11 @@ type ProExecutor interface {
 	PGTryAdvisoryXactLock(ctx context.Context, key int64) (bool, error)
 	PeriodicJobGetAll(ctx context.Context, params *PeriodicJobGetAllParams) ([]*PeriodicJob, error)
 	PeriodicJobGetByID(ctx context.Context, params *PeriodicJobGetByIDParams) (*PeriodicJob, error)
+	PeriodicJobInsert(ctx context.Context, params *PeriodicJobInsertParams) (*PeriodicJob, error)
 	PeriodicJobUpsert(ctx context.Context, params *PeriodicJobUpsertParams) (*PeriodicJob, error)
+	PeriodicJobUpdate(ctx context.Context, params *PeriodicJobUpdateParams) (*PeriodicJob, error)
+	PeriodicJobPause(ctx context.Context, params *PeriodicJobPauseParams) (*PeriodicJob, error)
+	PeriodicJobResume(ctx context.Context, params *PeriodicJobResumeParams) (*PeriodicJob, error)
 	PeriodicJobKeepAliveAndReap(ctx context.Context, params *PeriodicJobKeepAliveAndReapParams) ([]*PeriodicJob, error)
 	PeriodicJobUpsertMany(ctx context.Context, params *PeriodicJobUpsertManyParams) ([]*PeriodicJob, error)
 	PeriodicJobDelete(ctx context.Context, params *PeriodicJobDeleteParams) (*PeriodicJob, error)
@@ -280,10 +289,26 @@ type PeriodicJobGetByIDParams struct {
 	Schema string
 }
 
-// PeriodicJobUpsertParams is the params struct for a single-row
-// PeriodicJobUpsert. The same struct handles all writes: initial
-// insert, schedule changes, and pause/resume. Use the Paused field to
-// set paused_at (true = pause at now(), false = unpause).
+// PeriodicJobInsertParams contains a complete create-only periodic job definition.
+type PeriodicJobInsertParams struct {
+	ID             string
+	NextRunAt      time.Time
+	Schema         string
+	UpdatedAt      *time.Time
+	Kind           string
+	Args           []byte
+	Queue          string
+	Priority       int
+	MaxAttempts    int
+	Tags           []string
+	CronExpression *string
+	CronTimezone   string
+	Paused         bool
+}
+
+// PeriodicJobUpsertParams contains a complete periodic job definition.
+// ResetNextRunAt forces an explicit next-run replacement even when the cron
+// expression and timezone are unchanged.
 type PeriodicJobUpsertParams struct {
 	ID             string
 	NextRunAt      time.Time
@@ -297,10 +322,48 @@ type PeriodicJobUpsertParams struct {
 	Tags           []string
 	CronExpression *string
 	CronTimezone   string
-	// Paused sets paused_at on the row. true sets it to now() (if the
-	// row is already paused the existing value is preserved by
-	// COALESCE), false sets it to NULL.
-	Paused bool
+	Paused         bool
+	ResetNextRunAt bool
+}
+
+// PeriodicJobUpdateParams patches selected definition fields on an existing
+// periodic job. It never changes pause state.
+type PeriodicJobUpdateParams struct {
+	ID     string
+	Schema string
+
+	SetArgs bool
+	Kind    string
+	Args    []byte
+
+	SetQueue bool
+	Queue    string
+
+	SetPriority bool
+	Priority    int
+
+	SetMaxAttempts bool
+	MaxAttempts    int
+
+	SetTags bool
+	Tags    []string
+
+	SetSchedule    bool
+	NextRunAt      time.Time
+	CronExpression *string
+	CronTimezone   string
+}
+
+// PeriodicJobPauseParams identifies a periodic job to pause.
+type PeriodicJobPauseParams struct {
+	ID     string
+	Schema string
+}
+
+// PeriodicJobResumeParams identifies a periodic job to resume.
+type PeriodicJobResumeParams struct {
+	ID     string
+	Schema string
 }
 
 // PeriodicJobKeepAliveAndReapParams
@@ -1427,12 +1490,23 @@ const periodicJobSelectColumns = `id, created_at, next_run_at, updated_at, pause
 	kind, args, queue, priority, max_attempts, tags,
 	cron_expression, cron_timezone`
 
-// PeriodicJobChangeTopicSuffix is the unprefixed portion of the LISTEN
-// topic that the durable periodic jobs admin methods pg_notify on. The
-// fully-qualified topic is concat(schema, '.', Suffix) — schema-prefixed
-// to match upstream River's convention so multiple schemas can coexist on
-// the same database. Postgres limits topic length to 63 chars.
+// PeriodicJobChangeTopicSuffix is the base name of the LISTEN/NOTIFY topic.
 const PeriodicJobChangeTopicSuffix = "river_periodic_job_change"
+
+// PeriodicJobChangeTopic returns the schema-specific LISTEN/NOTIFY channel.
+// PostgreSQL channel names are limited to 63 bytes, so oversized schema names
+// are replaced with a stable hash while preserving cross-schema isolation.
+func PeriodicJobChangeTopic(schema string) string {
+	if schema == "" {
+		return PeriodicJobChangeTopicSuffix
+	}
+	topic := schema + "." + PeriodicJobChangeTopicSuffix
+	if len(topic) <= 63 {
+		return topic
+	}
+	hash := sha256.Sum256([]byte(schema))
+	return fmt.Sprintf("%s_%x", PeriodicJobChangeTopicSuffix, hash[:8])
+}
 
 // periodicJobQueueDefault returns the default queue if the caller passed an
 // empty value. Mirrors the schema default.
@@ -2196,10 +2270,67 @@ func (e *Executor) PeriodicJobGetByID(ctx context.Context, params *PeriodicJobGe
 	return nil, rivertype.ErrNotFound
 }
 
-// PeriodicJobUpsert inserts or updates a durable periodic job. The
-// single method handles all writes: initial insert, schedule change,
-// pause, and resume. To pause: pass Paused=true. To resume: pass
-// Paused=false (or use a separate Delete and re-insert).
+// PeriodicJobInsert creates a durable periodic job and fails when its ID is
+// already present.
+func (e *Executor) PeriodicJobInsert(ctx context.Context, params *PeriodicJobInsertParams) (*PeriodicJob, error) {
+	if params == nil {
+		return nil, errors.New("riverpro driver: nil params")
+	}
+	schema := params.Schema
+	now := nowUTC()
+	if params.UpdatedAt != nil {
+		now = *params.UpdatedAt
+	}
+	if dbAvailable(e) {
+		upsertParams := &PeriodicJobUpsertParams{
+			ID: params.ID, NextRunAt: params.NextRunAt, Schema: params.Schema, UpdatedAt: params.UpdatedAt,
+			Kind: params.Kind, Args: params.Args, Queue: params.Queue, Priority: params.Priority,
+			MaxAttempts: params.MaxAttempts, Tags: params.Tags, CronExpression: params.CronExpression,
+			CronTimezone: params.CronTimezone, Paused: params.Paused,
+		}
+		args, errMsg := periodicJobUpsertArgs(now, upsertParams)
+		if errMsg != "" {
+			return nil, errors.New(errMsg)
+		}
+		args = append(args, periodicJobCronTimezoneDefault(params.CronTimezone))
+		args = append(args, params.Paused)
+		notifyTopic := periodicJobChangeTopic(schema)
+		args = append(args, notifyTopic)
+		row, err := scanJSON[*PeriodicJob](ctx, e.Executor, fmt.Sprintf(`
+			WITH ins AS (
+				INSERT INTO %s (id, next_run_at, updated_at, kind, args, queue, priority, max_attempts, tags, cron_expression, cron_timezone, paused_at)
+				VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::text[], $10, $11, CASE WHEN $12::boolean THEN now() ELSE NULL END)
+				ON CONFLICT (id) DO NOTHING
+				RETURNING %s
+			),
+			notified AS (
+				SELECT pg_notify($13, '') FROM ins
+			)
+			SELECT %s FROM ins, notified
+		`, qt(schema, "river_periodic_job"), periodicJobSelectColumns, periodicJobJSONBuildObject), args...)
+		if errors.Is(err, rivertype.ErrNotFound) {
+			return nil, ErrPeriodicJobAlreadyExists
+		}
+		return row, err
+	}
+
+	compat.Lock()
+	defer compat.Unlock()
+	if compat.periodic[schema] == nil {
+		compat.periodic[schema] = map[string]*PeriodicJob{}
+	}
+	if compat.periodic[schema][params.ID] != nil {
+		return nil, ErrPeriodicJobAlreadyExists
+	}
+	job := periodicJobFromInsertParams(params, now)
+	compat.periodic[schema][params.ID] = job
+	clone := *job
+	return &clone, nil
+}
+
+// PeriodicJobUpsert reconciles a complete durable periodic job definition.
+// next_run_at is preserved when the cron schedule is unchanged unless
+// ResetNextRunAt is explicitly set.
 func (e *Executor) PeriodicJobUpsert(ctx context.Context, params *PeriodicJobUpsertParams) (*PeriodicJob, error) {
 	if params == nil {
 		return nil, errors.New("riverpro driver: nil params")
@@ -2210,26 +2341,26 @@ func (e *Executor) PeriodicJobUpsert(ctx context.Context, params *PeriodicJobUps
 		now = *params.UpdatedAt
 	}
 	if dbAvailable(e) {
-		cronTz := periodicJobCronTimezoneDefault(params.CronTimezone)
 		args, errMsg := periodicJobUpsertArgs(now, params)
 		if errMsg != "" {
 			return nil, errors.New(errMsg)
 		}
-		args = append(args, cronTz)        // 11: cron_timezone
-		args = append(args, params.Paused) // 12: paused bool
-		// pg_notify runs in the same statement as the UPSERT, so the
-		// notification is rolled back if the change is rolled back.
-		notifyTopic := PeriodicJobChangeTopicSuffix
-		if schema != "" {
-			notifyTopic = schema + "." + PeriodicJobChangeTopicSuffix
-		}
-		args = append(args, notifyTopic) // 13: notify topic
+		args = append(args, periodicJobCronTimezoneDefault(params.CronTimezone))
+		args = append(args, params.Paused)
+		args = append(args, params.ResetNextRunAt)
+		args = append(args, periodicJobChangeTopic(schema))
 		return scanJSON[*PeriodicJob](ctx, e.Executor, fmt.Sprintf(`
 			WITH ins AS (
-				INSERT INTO %s (id, next_run_at, updated_at, kind, args, queue, priority, max_attempts, tags, cron_expression, cron_timezone, paused_at)
+				INSERT INTO %s AS current (id, next_run_at, updated_at, kind, args, queue, priority, max_attempts, tags, cron_expression, cron_timezone, paused_at)
 				VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::text[], $10, $11, CASE WHEN $12::boolean THEN now() ELSE NULL END)
 				ON CONFLICT (id) DO UPDATE SET
-					next_run_at = excluded.next_run_at,
+					next_run_at = CASE
+						WHEN $13::boolean
+						  OR current.cron_expression IS DISTINCT FROM excluded.cron_expression
+						  OR current.cron_timezone IS DISTINCT FROM excluded.cron_timezone
+						THEN excluded.next_run_at
+						ELSE current.next_run_at
+					END,
 					updated_at = excluded.updated_at,
 					kind = excluded.kind,
 					args = excluded.args,
@@ -2239,65 +2370,228 @@ func (e *Executor) PeriodicJobUpsert(ctx context.Context, params *PeriodicJobUps
 					tags = excluded.tags,
 					cron_expression = excluded.cron_expression,
 					cron_timezone = excluded.cron_timezone,
-					paused_at = CASE WHEN $12::boolean THEN COALESCE(%s.paused_at, now()) ELSE NULL END
+					paused_at = CASE WHEN $12::boolean THEN COALESCE(current.paused_at, now()) ELSE NULL END
 				RETURNING %s
 			),
 			notified AS (
-				SELECT pg_notify($13, '') FROM ins
+				SELECT pg_notify($14, '') FROM ins
 			)
-			SELECT %s FROM ins
-		`, qt(schema, "river_periodic_job"), qt(schema, "river_periodic_job"), periodicJobSelectColumns, periodicJobJSONBuildObject), args...)
+			SELECT %s FROM ins, notified
+		`, qt(schema, "river_periodic_job"), periodicJobSelectColumns, periodicJobJSONBuildObject), args...)
 	}
-	job := &PeriodicJob{
-		ID:             params.ID,
-		CreatedAt:      nowUTC(),
-		NextRunAt:      params.NextRunAt,
-		UpdatedAt:      now,
-		Kind:           params.Kind,
-		Args:           append([]byte(nil), params.Args...),
-		Queue:          periodicJobQueueDefault(params.Queue),
-		Priority:       params.Priority,
-		MaxAttempts:    params.MaxAttempts,
-		Tags:           append([]string(nil), params.Tags...),
-		CronExpression: params.CronExpression,
-		CronTimezone:   periodicJobCronTimezoneDefault(params.CronTimezone),
-	}
-	if params.Paused {
-		t := now
-		job.PausedAt = &t
-	}
+
 	compat.Lock()
 	defer compat.Unlock()
 	if compat.periodic[schema] == nil {
 		compat.periodic[schema] = map[string]*PeriodicJob{}
 	}
 	existing := compat.periodic[schema][params.ID]
-	if existing != nil {
-		existing.NextRunAt = params.NextRunAt
-		existing.UpdatedAt = now
-		existing.Kind = job.Kind
-		existing.Args = job.Args
-		existing.Queue = job.Queue
-		existing.Priority = job.Priority
-		existing.MaxAttempts = job.MaxAttempts
-		existing.Tags = job.Tags
-		existing.CronExpression = job.CronExpression
-		existing.CronTimezone = job.CronTimezone
-		if params.Paused {
-			if existing.PausedAt == nil {
-				t := now
-				existing.PausedAt = &t
-			}
-		} else {
-			existing.PausedAt = nil
-		}
-		c := *existing
-		return &c, nil
+	if existing == nil {
+		job := periodicJobFromInsertParams(&PeriodicJobInsertParams{
+			ID: params.ID, NextRunAt: params.NextRunAt, Schema: params.Schema, UpdatedAt: params.UpdatedAt,
+			Kind: params.Kind, Args: params.Args, Queue: params.Queue, Priority: params.Priority,
+			MaxAttempts: params.MaxAttempts, Tags: params.Tags, CronExpression: params.CronExpression,
+			CronTimezone: params.CronTimezone, Paused: params.Paused,
+		}, now)
+		compat.periodic[schema][params.ID] = job
+		clone := *job
+		return &clone, nil
 	}
-	compat.periodic[schema][params.ID] = job
-	c := *job
-	return &c, nil
+	scheduleChanged := !equalStringPtr(existing.CronExpression, params.CronExpression) ||
+		existing.CronTimezone != periodicJobCronTimezoneDefault(params.CronTimezone)
+	if params.ResetNextRunAt || scheduleChanged {
+		existing.NextRunAt = params.NextRunAt
+	}
+	existing.UpdatedAt = now
+	existing.Kind = params.Kind
+	existing.Args = append([]byte(nil), params.Args...)
+	existing.Queue = periodicJobQueueDefault(params.Queue)
+	existing.Priority = params.Priority
+	existing.MaxAttempts = params.MaxAttempts
+	existing.Tags = append([]string(nil), params.Tags...)
+	existing.CronExpression = cloneStringPtr(params.CronExpression)
+	existing.CronTimezone = periodicJobCronTimezoneDefault(params.CronTimezone)
+	setPeriodicJobPaused(existing, params.Paused, now)
+	clone := *existing
+	return &clone, nil
 }
+
+// PeriodicJobUpdate patches selected definition fields without changing pause
+// state. It returns rivertype.ErrNotFound when the ID does not exist.
+func (e *Executor) PeriodicJobUpdate(ctx context.Context, params *PeriodicJobUpdateParams) (*PeriodicJob, error) {
+	if params == nil {
+		return nil, errors.New("riverpro driver: nil params")
+	}
+	if params.SetArgs && params.Kind == "" {
+		return nil, errors.New("riverpro driver: periodic job kind must be non-empty")
+	}
+	schema := params.Schema
+	if dbAvailable(e) {
+		notifyTopic := periodicJobChangeTopic(schema)
+		return scanJSON[*PeriodicJob](ctx, e.Executor, fmt.Sprintf(`
+			WITH upd AS (
+				UPDATE %s
+				SET kind = CASE WHEN $2::boolean THEN $3 ELSE kind END,
+				    args = CASE WHEN $2::boolean THEN $4::jsonb ELSE args END,
+				    queue = CASE WHEN $5::boolean THEN $6 ELSE queue END,
+				    priority = CASE WHEN $7::boolean THEN $8 ELSE priority END,
+				    max_attempts = CASE WHEN $9::boolean THEN $10 ELSE max_attempts END,
+				    tags = CASE WHEN $11::boolean THEN $12::text[] ELSE tags END,
+				    next_run_at = CASE WHEN $13::boolean THEN $14 ELSE next_run_at END,
+				    cron_expression = CASE WHEN $13::boolean THEN $15 ELSE cron_expression END,
+				    cron_timezone = CASE WHEN $13::boolean THEN $16 ELSE cron_timezone END,
+				    updated_at = now()
+				WHERE id = $1
+				RETURNING %s
+			),
+			notified AS (
+				SELECT pg_notify($17, '') FROM upd
+			)
+			SELECT %s FROM upd, notified
+		`, qt(schema, "river_periodic_job"), periodicJobSelectColumns, periodicJobJSONBuildObject),
+			params.ID,
+			params.SetArgs, params.Kind, nullableJSONBytes(params.Args),
+			params.SetQueue, periodicJobQueueDefault(params.Queue),
+			params.SetPriority, params.Priority,
+			params.SetMaxAttempts, params.MaxAttempts,
+			params.SetTags, nonNilTags(params.Tags),
+			params.SetSchedule, params.NextRunAt, params.CronExpression, periodicJobCronTimezoneDefault(params.CronTimezone),
+			notifyTopic,
+		)
+	}
+
+	compat.Lock()
+	defer compat.Unlock()
+	existing := compat.periodic[schema][params.ID]
+	if existing == nil {
+		return nil, rivertype.ErrNotFound
+	}
+	if params.SetArgs {
+		existing.Kind = params.Kind
+		existing.Args = append([]byte(nil), params.Args...)
+	}
+	if params.SetQueue {
+		existing.Queue = periodicJobQueueDefault(params.Queue)
+	}
+	if params.SetPriority {
+		existing.Priority = params.Priority
+	}
+	if params.SetMaxAttempts {
+		existing.MaxAttempts = params.MaxAttempts
+	}
+	if params.SetTags {
+		existing.Tags = append([]string(nil), params.Tags...)
+	}
+	if params.SetSchedule {
+		existing.NextRunAt = params.NextRunAt
+		existing.CronExpression = cloneStringPtr(params.CronExpression)
+		existing.CronTimezone = periodicJobCronTimezoneDefault(params.CronTimezone)
+	}
+	existing.UpdatedAt = nowUTC()
+	clone := *existing
+	return &clone, nil
+}
+
+// PeriodicJobPause pauses a durable periodic job without changing its next run.
+func (e *Executor) PeriodicJobPause(ctx context.Context, params *PeriodicJobPauseParams) (*PeriodicJob, error) {
+	if params == nil {
+		return nil, errors.New("riverpro driver: nil params")
+	}
+	if dbAvailable(e) {
+		return scanJSON[*PeriodicJob](ctx, e.Executor, fmt.Sprintf(`
+			WITH upd AS (
+				UPDATE %s
+				SET paused_at = COALESCE(paused_at, now()), updated_at = now()
+				WHERE id = $1
+				RETURNING %s
+			),
+			notified AS (SELECT pg_notify($2, '') FROM upd)
+			SELECT %s FROM upd, notified
+		`, qt(params.Schema, "river_periodic_job"), periodicJobSelectColumns, periodicJobJSONBuildObject), params.ID, periodicJobChangeTopic(params.Schema))
+	}
+	compat.Lock()
+	defer compat.Unlock()
+	existing := compat.periodic[params.Schema][params.ID]
+	if existing == nil {
+		return nil, rivertype.ErrNotFound
+	}
+	now := nowUTC()
+	setPeriodicJobPaused(existing, true, now)
+	existing.UpdatedAt = now
+	clone := *existing
+	return &clone, nil
+}
+
+// PeriodicJobResume resumes a durable periodic job without changing its next run.
+func (e *Executor) PeriodicJobResume(ctx context.Context, params *PeriodicJobResumeParams) (*PeriodicJob, error) {
+	if params == nil {
+		return nil, errors.New("riverpro driver: nil params")
+	}
+	if dbAvailable(e) {
+		return scanJSON[*PeriodicJob](ctx, e.Executor, fmt.Sprintf(`
+			WITH upd AS (
+				UPDATE %s
+				SET paused_at = NULL, updated_at = now()
+				WHERE id = $1
+				RETURNING %s
+			),
+			notified AS (SELECT pg_notify($2, '') FROM upd)
+			SELECT %s FROM upd, notified
+		`, qt(params.Schema, "river_periodic_job"), periodicJobSelectColumns, periodicJobJSONBuildObject), params.ID, periodicJobChangeTopic(params.Schema))
+	}
+	compat.Lock()
+	defer compat.Unlock()
+	existing := compat.periodic[params.Schema][params.ID]
+	if existing == nil {
+		return nil, rivertype.ErrNotFound
+	}
+	existing.PausedAt = nil
+	existing.UpdatedAt = nowUTC()
+	clone := *existing
+	return &clone, nil
+}
+
+func periodicJobFromInsertParams(params *PeriodicJobInsertParams, now time.Time) *PeriodicJob {
+	job := &PeriodicJob{
+		ID: params.ID, CreatedAt: nowUTC(), NextRunAt: params.NextRunAt, UpdatedAt: now,
+		Kind: params.Kind, Args: append([]byte(nil), params.Args...), Queue: periodicJobQueueDefault(params.Queue),
+		Priority: params.Priority, MaxAttempts: params.MaxAttempts, Tags: append([]string(nil), params.Tags...),
+		CronExpression: cloneStringPtr(params.CronExpression), CronTimezone: periodicJobCronTimezoneDefault(params.CronTimezone),
+	}
+	setPeriodicJobPaused(job, params.Paused, now)
+	return job
+}
+
+func periodicJobChangeTopic(schema string) string {
+	return PeriodicJobChangeTopic(schema)
+}
+
+func setPeriodicJobPaused(job *PeriodicJob, paused bool, now time.Time) {
+	if paused {
+		if job.PausedAt == nil {
+			pausedAt := now
+			job.PausedAt = &pausedAt
+		}
+		return
+	}
+	job.PausedAt = nil
+}
+
+func equalStringPtr(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
 func (e *Executor) PeriodicJobKeepAliveAndReap(ctx context.Context, params *PeriodicJobKeepAliveAndReapParams) ([]*PeriodicJob, error) {
 	if params == nil {
 		return []*PeriodicJob{}, nil
@@ -2357,18 +2651,10 @@ func (e *Executor) PeriodicJobUpsertMany(ctx context.Context, params *PeriodicJo
 				continue
 			}
 			row, err := e.PeriodicJobUpsert(ctx, &PeriodicJobUpsertParams{
-				ID:             p.ID,
-				NextRunAt:      p.NextRunAt,
-				Schema:         schema,
-				UpdatedAt:      &p.UpdatedAt,
-				Kind:           p.Kind,
-				Args:           p.Args,
-				Queue:          p.Queue,
-				Priority:       p.Priority,
-				MaxAttempts:    p.MaxAttempts,
-				Tags:           p.Tags,
-				CronExpression: p.CronExpression,
-				CronTimezone:   p.CronTimezone,
+				ID: p.ID, NextRunAt: p.NextRunAt, Schema: schema, UpdatedAt: &p.UpdatedAt,
+				Kind: p.Kind, Args: p.Args, Queue: p.Queue, Priority: p.Priority,
+				MaxAttempts: p.MaxAttempts, Tags: p.Tags, CronExpression: p.CronExpression,
+				CronTimezone: p.CronTimezone, ResetNextRunAt: true,
 			})
 			if err != nil {
 				return out, err
@@ -2415,10 +2701,7 @@ func (e *Executor) PeriodicJobDelete(ctx context.Context, params *PeriodicJobDel
 		return nil, errors.New("riverpro driver: nil params")
 	}
 	if dbAvailable(e) {
-		notifyTopic := PeriodicJobChangeTopicSuffix
-		if params.Schema != "" {
-			notifyTopic = params.Schema + "." + PeriodicJobChangeTopicSuffix
-		}
+		notifyTopic := periodicJobChangeTopic(params.Schema)
 		return scanJSON[*PeriodicJob](ctx, e.Executor, fmt.Sprintf(`
 			WITH del AS (
 				DELETE FROM %s
@@ -2428,7 +2711,7 @@ func (e *Executor) PeriodicJobDelete(ctx context.Context, params *PeriodicJobDel
 			notified AS (
 				SELECT pg_notify($2, '') FROM del
 			)
-			SELECT %s FROM del
+			SELECT %s FROM del, notified
 		`, qt(params.Schema, "river_periodic_job"), periodicJobSelectColumns, periodicJobJSONBuildObject), params.ID, notifyTopic)
 	}
 	compat.Lock()

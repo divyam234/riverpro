@@ -3,6 +3,7 @@ package riverpro
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -10,39 +11,66 @@ import (
 	"time"
 
 	prodriver "github.com/divyam234/riverpro/driver"
+	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/robfig/cron/v3"
 )
 
-// PeriodicJobUpsertOpts describes a durable periodic job to upsert.
-// The same struct is used for initial insert, schedule changes, and
-// pause/resume. To pause a row, set Paused=true. To resume, set
-// Paused=false (paused_at is set to NULL).
-type PeriodicJobUpsertOpts struct {
-	ID          string
-	Kind        string
-	Args        []byte
+// ErrPeriodicJobAlreadyExists is returned when PeriodicJobInsert is called
+// with an ID that already exists.
+var ErrPeriodicJobAlreadyExists = prodriver.ErrPeriodicJobAlreadyExists
+
+// PeriodicJobSpec is the complete persisted definition of a durable periodic
+// job. JobArgs is preferred because River Pro derives Kind and JSON encoding
+// from it. Kind and Args remain available for callers that already have an
+// encoded payload.
+type PeriodicJobSpec struct {
+	ID      string
+	JobArgs river.JobArgs
+
+	// Kind and Args are the raw form of JobArgs. They are ignored when
+	// JobArgs is non-nil.
+	Kind string
+	Args []byte
+
 	Queue       string
 	Priority    int
 	MaxAttempts int
 	Tags        []string
 	Schedule    *PeriodicJobSchedule
-	// Paused: true pauses the row (paused_at = now() if not already
-	// paused), false clears paused_at. Always pass the desired state.
-	Paused bool
+	Paused      bool
+}
+
+// PeriodicJobInsertOpts describes a create-only durable periodic job.
+type PeriodicJobInsertOpts = PeriodicJobSpec
+
+// PeriodicJobUpsertOpts describes an idempotently reconciled durable periodic
+// job. When its cron schedule is unchanged and NextRunAt is omitted, the
+// existing database next_run_at is preserved.
+type PeriodicJobUpsertOpts = PeriodicJobSpec
+
+// PeriodicJobUpdateOpts patches an existing durable periodic job. Nil fields
+// preserve their current values. Updating the schedule is the only operation
+// that changes next_run_at.
+type PeriodicJobUpdateOpts struct {
+	JobArgs     river.JobArgs
+	Queue       *string
+	Priority    *int
+	MaxAttempts *int
+	Tags        *[]string
+	Schedule    *PeriodicJobSchedule
 }
 
 // PeriodicJobSchedule describes when a periodic job runs.
 type PeriodicJobSchedule struct {
-	// CronExpression is a standard 5-field cron spec. When set the
-	// row persists and fires on the cron.
+	// CronExpression is a standard five-field cron expression or supported
+	// descriptor. When set, the durable row remains after each execution.
 	CronExpression string
-	// CronTimezone is a tz database name (e.g. "UTC", "America/New_York").
-	// Defaults to "UTC" when CronExpression is set.
+	// CronTimezone is a tz database name. It defaults to UTC for cron jobs.
 	CronTimezone string
-	// NextRunAt is the next fire time. Required when CronExpression is
-	// empty (one-shot row); also used as the first fire time when a
-	// cron expression is provided.
+	// NextRunAt is required for one-shot jobs. For cron jobs it optionally
+	// overrides the first run; when omitted River Pro calculates the next cron
+	// tick. Upsert preserves the stored next run when the schedule is unchanged.
 	NextRunAt time.Time
 }
 
@@ -53,10 +81,7 @@ type PeriodicJobListOpts struct {
 
 // PeriodicJobList returns durable periodic jobs (paused and active).
 func (c *Client[TTx]) PeriodicJobList(ctx context.Context, opts *PeriodicJobListOpts) ([]*prodriver.PeriodicJob, error) {
-	if c == nil || c.proDriver == nil {
-		return nil, errors.New("riverpro: client is not configured with a Pro driver")
-	}
-	if err := c.requireDurablePeriodicJobsEnabled(); err != nil {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
 		return nil, err
 	}
 	max := 0
@@ -68,10 +93,7 @@ func (c *Client[TTx]) PeriodicJobList(ctx context.Context, opts *PeriodicJobList
 
 // PeriodicJobListTx is the transaction variant of PeriodicJobList.
 func (c *Client[TTx]) PeriodicJobListTx(ctx context.Context, tx TTx, opts *PeriodicJobListOpts) ([]*prodriver.PeriodicJob, error) {
-	if c == nil || c.proDriver == nil {
-		return nil, errors.New("riverpro: client is not configured with a Pro driver")
-	}
-	if err := c.requireDurablePeriodicJobsEnabled(); err != nil {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
 		return nil, err
 	}
 	max := 0
@@ -81,13 +103,9 @@ func (c *Client[TTx]) PeriodicJobListTx(ctx context.Context, tx TTx, opts *Perio
 	return c.proDriver.UnwrapProExecutor(tx).PeriodicJobGetAll(ctx, &prodriver.PeriodicJobGetAllParams{Max: max, Schema: c.config.Schema})
 }
 
-// PeriodicJobGet returns a single durable periodic job by ID. Returns
-// rivertype.ErrNotFound if no row matches.
+// PeriodicJobGet returns a single durable periodic job by ID.
 func (c *Client[TTx]) PeriodicJobGet(ctx context.Context, id string) (*prodriver.PeriodicJob, error) {
-	if c == nil || c.proDriver == nil {
-		return nil, errors.New("riverpro: client is not configured with a Pro driver")
-	}
-	if err := c.requireDurablePeriodicJobsEnabled(); err != nil {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
 		return nil, err
 	}
 	return c.proDriver.GetProExecutor().PeriodicJobGetByID(ctx, &prodriver.PeriodicJobGetByIDParams{ID: id, Schema: c.config.Schema})
@@ -95,25 +113,42 @@ func (c *Client[TTx]) PeriodicJobGet(ctx context.Context, id string) (*prodriver
 
 // PeriodicJobGetTx is the transaction variant of PeriodicJobGet.
 func (c *Client[TTx]) PeriodicJobGetTx(ctx context.Context, tx TTx, id string) (*prodriver.PeriodicJob, error) {
-	if c == nil || c.proDriver == nil {
-		return nil, errors.New("riverpro: client is not configured with a Pro driver")
-	}
-	if err := c.requireDurablePeriodicJobsEnabled(); err != nil {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
 		return nil, err
 	}
 	return c.proDriver.UnwrapProExecutor(tx).PeriodicJobGetByID(ctx, &prodriver.PeriodicJobGetByIDParams{ID: id, Schema: c.config.Schema})
 }
 
-// PeriodicJobUpsert inserts or updates a durable periodic job. The
-// single method handles all writes: initial insert, schedule change,
-// pause (set Paused=true), and resume (set Paused=false). To change a
-// row's schedule or pause state, call Upsert again with the same ID
-// and the new spec.
-func (c *Client[TTx]) PeriodicJobUpsert(ctx context.Context, opts *PeriodicJobUpsertOpts) (*prodriver.PeriodicJob, error) {
-	if c == nil || c.proDriver == nil {
-		return nil, errors.New("riverpro: client is not configured with a Pro driver")
+// PeriodicJobInsert creates a durable periodic job and fails with
+// ErrPeriodicJobAlreadyExists when the ID already exists.
+func (c *Client[TTx]) PeriodicJobInsert(ctx context.Context, opts *PeriodicJobInsertOpts) (*prodriver.PeriodicJob, error) {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
+		return nil, err
 	}
-	if err := c.requireDurablePeriodicJobsEnabled(); err != nil {
+	params, err := buildPeriodicJobInsertParams(opts, c.config)
+	if err != nil {
+		return nil, err
+	}
+	return c.proDriver.GetProExecutor().PeriodicJobInsert(ctx, params)
+}
+
+// PeriodicJobInsertTx is the transaction variant of PeriodicJobInsert.
+func (c *Client[TTx]) PeriodicJobInsertTx(ctx context.Context, tx TTx, opts *PeriodicJobInsertOpts) (*prodriver.PeriodicJob, error) {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
+		return nil, err
+	}
+	params, err := buildPeriodicJobInsertParams(opts, c.config)
+	if err != nil {
+		return nil, err
+	}
+	return c.proDriver.UnwrapProExecutor(tx).PeriodicJobInsert(ctx, params)
+}
+
+// PeriodicJobUpsert inserts or reconciles a complete durable periodic job
+// definition. It preserves next_run_at when the cron schedule is unchanged and
+// the caller did not explicitly provide NextRunAt.
+func (c *Client[TTx]) PeriodicJobUpsert(ctx context.Context, opts *PeriodicJobUpsertOpts) (*prodriver.PeriodicJob, error) {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
 		return nil, err
 	}
 	params, err := buildPeriodicJobUpsertParams(opts, c.config)
@@ -125,10 +160,7 @@ func (c *Client[TTx]) PeriodicJobUpsert(ctx context.Context, opts *PeriodicJobUp
 
 // PeriodicJobUpsertTx is the transaction variant of PeriodicJobUpsert.
 func (c *Client[TTx]) PeriodicJobUpsertTx(ctx context.Context, tx TTx, opts *PeriodicJobUpsertOpts) (*prodriver.PeriodicJob, error) {
-	if c == nil || c.proDriver == nil {
-		return nil, errors.New("riverpro: client is not configured with a Pro driver")
-	}
-	if err := c.requireDurablePeriodicJobsEnabled(); err != nil {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
 		return nil, err
 	}
 	params, err := buildPeriodicJobUpsertParams(opts, c.config)
@@ -138,69 +170,67 @@ func (c *Client[TTx]) PeriodicJobUpsertTx(ctx context.Context, tx TTx, opts *Per
 	return c.proDriver.UnwrapProExecutor(tx).PeriodicJobUpsert(ctx, params)
 }
 
-// buildPeriodicJobUpsertParams validates an Upsert opts struct and
-// converts it into the driver's PeriodicJobUpsertParams.
-func buildPeriodicJobUpsertParams(opts *PeriodicJobUpsertOpts, config *Config) (*prodriver.PeriodicJobUpsertParams, error) {
-	if opts == nil {
-		return nil, errors.New("riverpro: nil PeriodicJobUpsertOpts")
+// PeriodicJobUpdate patches an existing durable periodic job. It never inserts
+// a missing ID and never changes pause state.
+func (c *Client[TTx]) PeriodicJobUpdate(ctx context.Context, id string, opts *PeriodicJobUpdateOpts) (*prodriver.PeriodicJob, error) {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
+		return nil, err
 	}
-	if opts.ID == "" {
-		return nil, errors.New("riverpro: periodic job ID is empty")
+	params, err := buildPeriodicJobUpdateParams(id, opts, c.config)
+	if err != nil {
+		return nil, err
 	}
-	if opts.Kind == "" {
-		return nil, errors.New("riverpro: periodic job kind is empty")
-	}
-	if opts.Schedule == nil {
-		return nil, errors.New("riverpro: periodic job schedule is nil")
-	}
-	if opts.Schedule.CronExpression == "" && opts.Schedule.NextRunAt.IsZero() {
-		return nil, errors.New("riverpro: periodic job schedule must set CronExpression or NextRunAt")
-	}
-	cronExpr := opts.Schedule.CronExpression
-	var cronExprPtr *string
-	if cronExpr != "" {
-		cronExprPtr = &cronExpr
-	}
-	cronTz := opts.Schedule.CronTimezone
-	if cronExpr != "" && cronTz == "" {
-		cronTz = "UTC"
-	}
-	nextRunAt := opts.Schedule.NextRunAt
-	if nextRunAt.IsZero() {
-		// Default to now + StartStaggerSpread to spread startup load.
-		spread := time.Minute
-		if config != nil && config.DurablePeriodicJobs.StartStaggerSpread > 0 {
-			spread = config.DurablePeriodicJobs.StartStaggerSpread
-		}
-		nextRunAt = time.Now().Add(spread)
-	}
-	schema := ""
-	if config != nil {
-		schema = config.Schema
-	}
-	return &prodriver.PeriodicJobUpsertParams{
-		Args:           opts.Args,
-		CronExpression: cronExprPtr,
-		CronTimezone:   cronTz,
-		ID:             opts.ID,
-		Kind:           opts.Kind,
-		MaxAttempts:    opts.MaxAttempts,
-		NextRunAt:      nextRunAt,
-		Paused:         opts.Paused,
-		Priority:       opts.Priority,
-		Queue:          opts.Queue,
-		Schema:         schema,
-		Tags:           opts.Tags,
-	}, nil
+	return c.proDriver.GetProExecutor().PeriodicJobUpdate(ctx, params)
 }
 
-// PeriodicJobDelete removes a durable periodic job by ID. Returns the
-// deleted row, or rivertype.ErrNotFound if no row matched.
-func (c *Client[TTx]) PeriodicJobDelete(ctx context.Context, id string) (*prodriver.PeriodicJob, error) {
-	if c == nil || c.proDriver == nil {
-		return nil, errors.New("riverpro: client is not configured with a Pro driver")
+// PeriodicJobUpdateTx is the transaction variant of PeriodicJobUpdate.
+func (c *Client[TTx]) PeriodicJobUpdateTx(ctx context.Context, tx TTx, id string, opts *PeriodicJobUpdateOpts) (*prodriver.PeriodicJob, error) {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
+		return nil, err
 	}
-	if err := c.requireDurablePeriodicJobsEnabled(); err != nil {
+	params, err := buildPeriodicJobUpdateParams(id, opts, c.config)
+	if err != nil {
+		return nil, err
+	}
+	return c.proDriver.UnwrapProExecutor(tx).PeriodicJobUpdate(ctx, params)
+}
+
+// PeriodicJobPause pauses an existing durable periodic job.
+func (c *Client[TTx]) PeriodicJobPause(ctx context.Context, id string) (*prodriver.PeriodicJob, error) {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
+		return nil, err
+	}
+	return c.proDriver.GetProExecutor().PeriodicJobPause(ctx, &prodriver.PeriodicJobPauseParams{ID: id, Schema: c.config.Schema})
+}
+
+// PeriodicJobPauseTx is the transaction variant of PeriodicJobPause.
+func (c *Client[TTx]) PeriodicJobPauseTx(ctx context.Context, tx TTx, id string) (*prodriver.PeriodicJob, error) {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
+		return nil, err
+	}
+	return c.proDriver.UnwrapProExecutor(tx).PeriodicJobPause(ctx, &prodriver.PeriodicJobPauseParams{ID: id, Schema: c.config.Schema})
+}
+
+// PeriodicJobResume resumes an existing durable periodic job without changing
+// its stored next_run_at.
+func (c *Client[TTx]) PeriodicJobResume(ctx context.Context, id string) (*prodriver.PeriodicJob, error) {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
+		return nil, err
+	}
+	return c.proDriver.GetProExecutor().PeriodicJobResume(ctx, &prodriver.PeriodicJobResumeParams{ID: id, Schema: c.config.Schema})
+}
+
+// PeriodicJobResumeTx is the transaction variant of PeriodicJobResume.
+func (c *Client[TTx]) PeriodicJobResumeTx(ctx context.Context, tx TTx, id string) (*prodriver.PeriodicJob, error) {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
+		return nil, err
+	}
+	return c.proDriver.UnwrapProExecutor(tx).PeriodicJobResume(ctx, &prodriver.PeriodicJobResumeParams{ID: id, Schema: c.config.Schema})
+}
+
+// PeriodicJobDelete removes a durable periodic job by ID.
+func (c *Client[TTx]) PeriodicJobDelete(ctx context.Context, id string) (*prodriver.PeriodicJob, error) {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
 		return nil, err
 	}
 	return c.proDriver.GetProExecutor().PeriodicJobDelete(ctx, &prodriver.PeriodicJobDeleteParams{ID: id, Schema: c.config.Schema})
@@ -208,19 +238,223 @@ func (c *Client[TTx]) PeriodicJobDelete(ctx context.Context, id string) (*prodri
 
 // PeriodicJobDeleteTx is the transaction variant of PeriodicJobDelete.
 func (c *Client[TTx]) PeriodicJobDeleteTx(ctx context.Context, tx TTx, id string) (*prodriver.PeriodicJob, error) {
-	if c == nil || c.proDriver == nil {
-		return nil, errors.New("riverpro: client is not configured with a Pro driver")
-	}
-	if err := c.requireDurablePeriodicJobsEnabled(); err != nil {
+	if err := c.requireDurablePeriodicJobsClient(); err != nil {
 		return nil, err
 	}
 	return c.proDriver.UnwrapProExecutor(tx).PeriodicJobDelete(ctx, &prodriver.PeriodicJobDeleteParams{ID: id, Schema: c.config.Schema})
 }
 
-// PeriodicJobUpdateSchedule is removed; PeriodicJobUpsert performs a
-// full UPSERT, so callers can change a row's schedule (cron, timezone,
-// next run) or pause state by calling Upsert with the same ID and the
-// new spec.
+type periodicJobDefinition struct {
+	id              string
+	kind            string
+	args            []byte
+	queue           string
+	priority        int
+	maxAttempts     int
+	tags            []string
+	cronExpression  *string
+	cronTimezone    string
+	nextRunAt       time.Time
+	nextRunExplicit bool
+	paused          bool
+}
+
+func buildPeriodicJobInsertParams(opts *PeriodicJobInsertOpts, config *Config) (*prodriver.PeriodicJobInsertParams, error) {
+	definition, err := buildPeriodicJobDefinition(opts, config)
+	if err != nil {
+		return nil, err
+	}
+	return &prodriver.PeriodicJobInsertParams{
+		ID: definition.id, Kind: definition.kind, Args: definition.args,
+		Queue: definition.queue, Priority: definition.priority, MaxAttempts: definition.maxAttempts,
+		Tags: definition.tags, CronExpression: definition.cronExpression, CronTimezone: definition.cronTimezone,
+		NextRunAt: definition.nextRunAt, Paused: definition.paused, Schema: schemaFromConfig(config),
+	}, nil
+}
+
+func buildPeriodicJobUpsertParams(opts *PeriodicJobUpsertOpts, config *Config) (*prodriver.PeriodicJobUpsertParams, error) {
+	definition, err := buildPeriodicJobDefinition(opts, config)
+	if err != nil {
+		return nil, err
+	}
+	return &prodriver.PeriodicJobUpsertParams{
+		ID: definition.id, Kind: definition.kind, Args: definition.args,
+		Queue: definition.queue, Priority: definition.priority, MaxAttempts: definition.maxAttempts,
+		Tags: definition.tags, CronExpression: definition.cronExpression, CronTimezone: definition.cronTimezone,
+		NextRunAt: definition.nextRunAt, ResetNextRunAt: definition.nextRunExplicit,
+		Paused: definition.paused, Schema: schemaFromConfig(config),
+	}, nil
+}
+
+func buildPeriodicJobDefinition(opts *PeriodicJobSpec, config *Config) (*periodicJobDefinition, error) {
+	if opts == nil {
+		return nil, errors.New("riverpro: nil periodic job options")
+	}
+	if opts.ID == "" {
+		return nil, errors.New("riverpro: periodic job ID is empty")
+	}
+	kind, encodedArgs, err := encodePeriodicJobArgs(opts.JobArgs, opts.Kind, opts.Args)
+	if err != nil {
+		return nil, err
+	}
+	cronExpression, cronTimezone, nextRunAt, explicit, err := normalizePeriodicJobSchedule(opts.Schedule, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	var jobInsertOpts river.InsertOpts
+	if argsWithOpts, ok := opts.JobArgs.(river.JobArgsWithInsertOpts); ok {
+		jobInsertOpts = argsWithOpts.InsertOpts()
+	}
+	queue := opts.Queue
+	if queue == "" {
+		queue = jobInsertOpts.Queue
+	}
+	if queue == "" {
+		queue = river.QueueDefault
+	}
+	priority := opts.Priority
+	if priority <= 0 {
+		priority = jobInsertOpts.Priority
+	}
+	if priority <= 0 {
+		priority = river.PriorityDefault
+	}
+	maxAttempts := opts.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = jobInsertOpts.MaxAttempts
+	}
+	if maxAttempts <= 0 {
+		maxAttempts = river.MaxAttemptsDefault
+	}
+	tags := opts.Tags
+	if tags == nil {
+		tags = jobInsertOpts.Tags
+	}
+	return &periodicJobDefinition{
+		id: opts.ID, kind: kind, args: encodedArgs, queue: queue, priority: priority,
+		maxAttempts: maxAttempts, tags: append([]string(nil), tags...),
+		cronExpression: cronExpression, cronTimezone: cronTimezone,
+		nextRunAt: nextRunAt, nextRunExplicit: explicit, paused: opts.Paused,
+	}, nil
+}
+
+func buildPeriodicJobUpdateParams(id string, opts *PeriodicJobUpdateOpts, config *Config) (*prodriver.PeriodicJobUpdateParams, error) {
+	if id == "" {
+		return nil, errors.New("riverpro: periodic job ID is empty")
+	}
+	if opts == nil {
+		return nil, errors.New("riverpro: nil PeriodicJobUpdateOpts")
+	}
+	params := &prodriver.PeriodicJobUpdateParams{ID: id, Schema: schemaFromConfig(config)}
+	if opts.JobArgs != nil {
+		kind, encodedArgs, err := encodePeriodicJobArgs(opts.JobArgs, "", nil)
+		if err != nil {
+			return nil, err
+		}
+		params.SetArgs, params.Kind, params.Args = true, kind, encodedArgs
+	}
+	if opts.Queue != nil {
+		params.SetQueue = true
+		params.Queue = *opts.Queue
+		if params.Queue == "" {
+			params.Queue = river.QueueDefault
+		}
+	}
+	if opts.Priority != nil {
+		params.SetPriority = true
+		params.Priority = *opts.Priority
+		if params.Priority <= 0 {
+			params.Priority = river.PriorityDefault
+		}
+	}
+	if opts.MaxAttempts != nil {
+		params.SetMaxAttempts = true
+		params.MaxAttempts = *opts.MaxAttempts
+		if params.MaxAttempts <= 0 {
+			params.MaxAttempts = river.MaxAttemptsDefault
+		}
+	}
+	if opts.Tags != nil {
+		params.SetTags = true
+		params.Tags = append([]string(nil), (*opts.Tags)...)
+	}
+	if opts.Schedule != nil {
+		cronExpression, cronTimezone, nextRunAt, _, err := normalizePeriodicJobSchedule(opts.Schedule, time.Now())
+		if err != nil {
+			return nil, err
+		}
+		params.SetSchedule = true
+		params.CronExpression = cronExpression
+		params.CronTimezone = cronTimezone
+		params.NextRunAt = nextRunAt
+	}
+	if !params.SetArgs && !params.SetQueue && !params.SetPriority && !params.SetMaxAttempts && !params.SetTags && !params.SetSchedule {
+		return nil, errors.New("riverpro: periodic job update has no fields")
+	}
+	return params, nil
+}
+
+func encodePeriodicJobArgs(jobArgs river.JobArgs, kind string, encodedArgs []byte) (string, []byte, error) {
+	if jobArgs != nil {
+		kind = jobArgs.Kind()
+		var err error
+		encodedArgs, err = json.Marshal(jobArgs)
+		if err != nil {
+			return "", nil, fmt.Errorf("riverpro: encode periodic job args: %w", err)
+		}
+	}
+	if kind == "" {
+		return "", nil, errors.New("riverpro: periodic job kind is empty")
+	}
+	if len(encodedArgs) == 0 {
+		encodedArgs = []byte(`{}`)
+	}
+	if !json.Valid(encodedArgs) {
+		return "", nil, errors.New("riverpro: periodic job args are not valid JSON")
+	}
+	return kind, append([]byte(nil), encodedArgs...), nil
+}
+
+func normalizePeriodicJobSchedule(schedule *PeriodicJobSchedule, now time.Time) (*string, string, time.Time, bool, error) {
+	if schedule == nil {
+		return nil, "", time.Time{}, false, errors.New("riverpro: periodic job schedule is nil")
+	}
+	if schedule.CronExpression == "" {
+		if schedule.NextRunAt.IsZero() {
+			return nil, "", time.Time{}, false, errors.New("riverpro: one-shot periodic job requires NextRunAt")
+		}
+		return nil, "UTC", schedule.NextRunAt, true, nil
+	}
+	cronTimezone := schedule.CronTimezone
+	if cronTimezone == "" {
+		cronTimezone = "UTC"
+	}
+	calculated, err := cronNextAfter(schedule.CronExpression, cronTimezone, now)
+	if err != nil {
+		return nil, "", time.Time{}, false, err
+	}
+	nextRunAt := schedule.NextRunAt
+	explicit := !nextRunAt.IsZero()
+	if nextRunAt.IsZero() {
+		nextRunAt = calculated
+	}
+	cronExpression := schedule.CronExpression
+	return &cronExpression, cronTimezone, nextRunAt, explicit, nil
+}
+
+func schemaFromConfig(config *Config) string {
+	if config == nil {
+		return ""
+	}
+	return config.Schema
+}
+
+func (c *Client[TTx]) requireDurablePeriodicJobsClient() error {
+	if c == nil || c.proDriver == nil {
+		return errors.New("riverpro: client is not configured with a Pro driver")
+	}
+	return c.requireDurablePeriodicJobsEnabled()
+}
 
 // requireDurablePeriodicJobsEnabled returns prodriver.ErrNotSupported if
 // DurablePeriodicJobs is disabled in the config.
@@ -282,10 +516,7 @@ func (c *Client[TTx]) periodicEnqueuerPollingLoop(ctx context.Context) {
 // notification. A 30s safety ticker catches any missed notifications.
 func (c *Client[TTx]) periodicEnqueuerListenerLoop(ctx context.Context) {
 	schema := c.config.Schema
-	topic := prodriver.PeriodicJobChangeTopicSuffix
-	if schema != "" {
-		topic = schema + "." + prodriver.PeriodicJobChangeTopicSuffix
-	}
+	topic := prodriver.PeriodicJobChangeTopic(schema)
 
 	listener := c.proDriver.GetListener(&riverdriver.GetListenenerParams{Schema: schema})
 	if err := listener.Connect(ctx); err != nil {
@@ -448,4 +679,3 @@ func cronNextAfter(expr, tz string, now time.Time) (time.Time, error) {
 
 // sortedPeriodicJobIDs is removed; tests can use sort.Strings on the
 // raw ID slice inline.
-

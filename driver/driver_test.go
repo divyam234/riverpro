@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/riverqueue/river/riverdriver"
+	"github.com/riverqueue/river/rivertype"
 )
 
 func TestPublicExecutorInterfaces(t *testing.T) {
@@ -15,6 +16,24 @@ func TestPublicExecutorInterfaces(t *testing.T) {
 	var _ ProExecutorTx = (*ExecutorTx)(nil)
 	var _ riverdriver.Executor = (*Executor)(nil)
 	var _ riverdriver.ExecutorTx = (*ExecutorTx)(nil)
+}
+
+func TestPeriodicJobChangeTopic(t *testing.T) {
+	if got, want := PeriodicJobChangeTopic("app"), "app."+PeriodicJobChangeTopicSuffix; got != want {
+		t.Fatalf("short topic = %q, want %q", got, want)
+	}
+
+	longSchema := "riverpro_2026_07_18t20_22_48_schema_01"
+	got := PeriodicJobChangeTopic(longSchema)
+	if len(got) > 63 {
+		t.Fatalf("long topic has %d bytes, want at most 63: %q", len(got), got)
+	}
+	if got != PeriodicJobChangeTopic(longSchema) {
+		t.Fatalf("long topic is not deterministic: %q", got)
+	}
+	if got == PeriodicJobChangeTopic(longSchema+"_other") {
+		t.Fatalf("different schemas produced the same topic: %q", got)
+	}
 }
 
 func TestMigrationLinesAndFS(t *testing.T) {
@@ -165,4 +184,85 @@ func TestDriverPublicErrorCompatibility(t *testing.T) {
 		}()
 		_ = MigrationLineProTruncateTables("main", 0)
 	}()
+}
+
+func TestCompatibilityPeriodicJobMutationSemantics(t *testing.T) {
+	ctx := context.Background()
+	exec := &Executor{}
+	schema := "test_schema_periodic_mutations"
+	cron := "0 */2 * * *"
+	initialNextRun := time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
+
+	inserted, err := exec.PeriodicJobInsert(ctx, &PeriodicJobInsertParams{
+		ID: "periodic", Kind: "kind-a", Args: []byte(`{"value":"a"}`),
+		Queue: "queue-a", Priority: 2, MaxAttempts: 3,
+		CronExpression: &cron, CronTimezone: "UTC", NextRunAt: initialNextRun, Schema: schema,
+	})
+	if err != nil {
+		t.Fatalf("PeriodicJobInsert: %v", err)
+	}
+	if _, err := exec.PeriodicJobInsert(ctx, &PeriodicJobInsertParams{
+		ID: "periodic", Kind: "kind-a", CronExpression: &cron, NextRunAt: initialNextRun, Schema: schema,
+	}); !errors.Is(err, ErrPeriodicJobAlreadyExists) {
+		t.Fatalf("duplicate insert error = %v, want ErrPeriodicJobAlreadyExists", err)
+	}
+
+	candidateNextRun := initialNextRun.Add(2 * time.Hour)
+	upserted, err := exec.PeriodicJobUpsert(ctx, &PeriodicJobUpsertParams{
+		ID: "periodic", Kind: "kind-b", Args: []byte(`{"value":"b"}`),
+		Queue: "queue-b", Priority: 3, MaxAttempts: 4,
+		CronExpression: &cron, CronTimezone: "UTC", NextRunAt: candidateNextRun, Schema: schema,
+	})
+	if err != nil {
+		t.Fatalf("PeriodicJobUpsert: %v", err)
+	}
+	if !upserted.NextRunAt.Equal(initialNextRun) {
+		t.Fatalf("unchanged schedule reset next run: got %v want %v", upserted.NextRunAt, initialNextRun)
+	}
+	if upserted.Kind != "kind-b" || upserted.Queue != "queue-b" {
+		t.Fatalf("upsert did not reconcile definition: %#v", upserted)
+	}
+
+	reset, err := exec.PeriodicJobUpsert(ctx, &PeriodicJobUpsertParams{
+		ID: "periodic", Kind: "kind-b", Args: []byte(`{"value":"b"}`),
+		Queue: "queue-b", Priority: 3, MaxAttempts: 4,
+		CronExpression: &cron, CronTimezone: "UTC", NextRunAt: candidateNextRun,
+		ResetNextRunAt: true, Schema: schema,
+	})
+	if err != nil {
+		t.Fatalf("PeriodicJobUpsert reset: %v", err)
+	}
+	if !reset.NextRunAt.Equal(candidateNextRun) {
+		t.Fatalf("explicit reset next run = %v, want %v", reset.NextRunAt, candidateNextRun)
+	}
+
+	updated, err := exec.PeriodicJobUpdate(ctx, &PeriodicJobUpdateParams{
+		ID: "periodic", Schema: schema, SetArgs: true, Kind: "kind-c", Args: []byte(`{"value":"c"}`),
+	})
+	if err != nil {
+		t.Fatalf("PeriodicJobUpdate: %v", err)
+	}
+	if updated.Kind != "kind-c" || !updated.NextRunAt.Equal(candidateNextRun) {
+		t.Fatalf("args update changed runtime state: %#v", updated)
+	}
+
+	paused, err := exec.PeriodicJobPause(ctx, &PeriodicJobPauseParams{ID: "periodic", Schema: schema})
+	if err != nil {
+		t.Fatalf("PeriodicJobPause: %v", err)
+	}
+	if paused.PausedAt == nil || !paused.NextRunAt.Equal(candidateNextRun) {
+		t.Fatalf("pause changed next run or did not pause: %#v", paused)
+	}
+	resumed, err := exec.PeriodicJobResume(ctx, &PeriodicJobResumeParams{ID: "periodic", Schema: schema})
+	if err != nil {
+		t.Fatalf("PeriodicJobResume: %v", err)
+	}
+	if resumed.PausedAt != nil || !resumed.NextRunAt.Equal(candidateNextRun) {
+		t.Fatalf("resume changed next run or did not resume: %#v", resumed)
+	}
+
+	if _, err := exec.PeriodicJobUpdate(ctx, &PeriodicJobUpdateParams{ID: "missing", Schema: schema, SetQueue: true, Queue: "x"}); !errors.Is(err, rivertype.ErrNotFound) {
+		t.Fatalf("missing update error = %v, want rivertype.ErrNotFound", err)
+	}
+	_ = inserted
 }

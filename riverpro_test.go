@@ -241,3 +241,80 @@ func TestClientContextRoundTripAndSmallHelpers(t *testing.T) {
 		t.Fatalf("unexpected TaskHasNoOutputError message: %q", missingOutput.Error())
 	}
 }
+
+type periodicTestArgs struct {
+	Value string `json:"value"`
+}
+
+func (periodicTestArgs) Kind() string { return "periodic_test" }
+func (periodicTestArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{Queue: "periodic", Priority: 3, MaxAttempts: 7, Tags: []string{"typed"}}
+}
+
+func TestBuildPeriodicJobUpsertParamsUsesTypedArgsAndInsertDefaults(t *testing.T) {
+	params, err := buildPeriodicJobUpsertParams(&PeriodicJobUpsertOpts{
+		ID:      "typed-periodic",
+		JobArgs: periodicTestArgs{Value: "hello"},
+		Schedule: &PeriodicJobSchedule{
+			CronExpression: "0 */2 * * *",
+		},
+	}, &Config{Config: river.Config{Schema: "custom"}})
+	if err != nil {
+		t.Fatalf("buildPeriodicJobUpsertParams: %v", err)
+	}
+	if params.Kind != "periodic_test" || string(params.Args) != `{"value":"hello"}` {
+		t.Fatalf("unexpected encoded args: kind=%q args=%s", params.Kind, params.Args)
+	}
+	if params.Queue != "periodic" || params.Priority != 3 || params.MaxAttempts != 7 {
+		t.Fatalf("unexpected insert defaults: %#v", params)
+	}
+	if len(params.Tags) != 1 || params.Tags[0] != "typed" {
+		t.Fatalf("unexpected tags: %#v", params.Tags)
+	}
+	if params.NextRunAt.IsZero() {
+		t.Fatal("cron upsert should calculate an initial next run")
+	}
+	if params.ResetNextRunAt {
+		t.Fatal("implicit cron next run should not force replacement on an existing row")
+	}
+	if params.Schema != "custom" {
+		t.Fatalf("unexpected schema: %q", params.Schema)
+	}
+}
+
+func TestBuildPeriodicJobUpsertParamsExplicitNextRunResetsCursor(t *testing.T) {
+	nextRunAt := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Second)
+	params, err := buildPeriodicJobUpsertParams(&PeriodicJobUpsertOpts{
+		ID:      "explicit-next-run",
+		JobArgs: periodicTestArgs{},
+		Schedule: &PeriodicJobSchedule{
+			CronExpression: "0 */2 * * *",
+			NextRunAt:      nextRunAt,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("buildPeriodicJobUpsertParams: %v", err)
+	}
+	if !params.ResetNextRunAt || !params.NextRunAt.Equal(nextRunAt) {
+		t.Fatalf("explicit next run not preserved: %#v", params)
+	}
+}
+
+func TestBuildPeriodicJobUpdateParamsPatchesOnlySelectedFields(t *testing.T) {
+	params, err := buildPeriodicJobUpdateParams("periodic-update", &PeriodicJobUpdateOpts{
+		JobArgs: periodicTestArgs{Value: "updated"},
+	}, nil)
+	if err != nil {
+		t.Fatalf("buildPeriodicJobUpdateParams: %v", err)
+	}
+	if !params.SetArgs || params.Kind != "periodic_test" || string(params.Args) != `{"value":"updated"}` {
+		t.Fatalf("unexpected args patch: %#v", params)
+	}
+	if params.SetQueue || params.SetPriority || params.SetMaxAttempts || params.SetTags || params.SetSchedule {
+		t.Fatalf("unexpected fields selected: %#v", params)
+	}
+
+	if _, err := buildPeriodicJobUpdateParams("periodic-update", &PeriodicJobUpdateOpts{}, nil); err == nil {
+		t.Fatal("empty periodic update should fail validation")
+	}
+}

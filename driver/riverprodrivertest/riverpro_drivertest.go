@@ -326,6 +326,71 @@ func exercisePeriodicJobs[TTx any](ctx context.Context, t *testing.T,
 		require.Nil(t, resumed.PausedAt)
 	})
 
+	t.Run("PeriodicJobsMutationSemantics", func(t *testing.T) {
+		t.Parallel()
+		exec, schema := execSchema(ctx, t, executorWithTx)
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		cron := "0 */2 * * *"
+		initialNextRun := now.Add(time.Hour)
+
+		inserted, err := exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{
+			ID: "periodic-mutate", Kind: "kind-a", Args: []byte(`{"value":"a"}`),
+			Queue: "queue-a", Priority: 2, MaxAttempts: 3,
+			CronExpression: &cron, CronTimezone: "UTC", NextRunAt: initialNextRun, Schema: schema,
+		})
+		require.NoError(t, err)
+		require.True(t, initialNextRun.Equal(inserted.NextRunAt), "expected %v got %v", initialNextRun, inserted.NextRunAt)
+
+		_, err = exec.PeriodicJobInsert(ctx, &driver.PeriodicJobInsertParams{
+			ID: "periodic-mutate", Kind: "kind-a", CronExpression: &cron,
+			NextRunAt: initialNextRun, Schema: schema,
+		})
+		require.ErrorIs(t, err, driver.ErrPeriodicJobAlreadyExists)
+
+		candidateNextRun := initialNextRun.Add(2 * time.Hour)
+		upserted, err := exec.PeriodicJobUpsert(ctx, &driver.PeriodicJobUpsertParams{
+			ID: "periodic-mutate", Kind: "kind-b", Args: []byte(`{"value":"b"}`),
+			Queue: "queue-b", Priority: 3, MaxAttempts: 4,
+			CronExpression: &cron, CronTimezone: "UTC", NextRunAt: candidateNextRun, Schema: schema,
+		})
+		require.NoError(t, err)
+		require.True(t, initialNextRun.Equal(upserted.NextRunAt), "unchanged cron reset next_run_at: expected %v got %v", initialNextRun, upserted.NextRunAt)
+		require.Equal(t, "kind-b", upserted.Kind)
+		require.Equal(t, "queue-b", upserted.Queue)
+
+		reset, err := exec.PeriodicJobUpsert(ctx, &driver.PeriodicJobUpsertParams{
+			ID: "periodic-mutate", Kind: "kind-b", Args: []byte(`{"value":"b"}`),
+			Queue: "queue-b", Priority: 3, MaxAttempts: 4,
+			CronExpression: &cron, CronTimezone: "UTC", NextRunAt: candidateNextRun,
+			ResetNextRunAt: true, Schema: schema,
+		})
+		require.NoError(t, err)
+		require.True(t, candidateNextRun.Equal(reset.NextRunAt), "expected %v got %v", candidateNextRun, reset.NextRunAt)
+
+		updated, err := exec.PeriodicJobUpdate(ctx, &driver.PeriodicJobUpdateParams{
+			ID: "periodic-mutate", Schema: schema,
+			SetArgs: true, Kind: "kind-c", Args: []byte(`{"value":"c"}`),
+		})
+		require.NoError(t, err)
+		require.Equal(t, "kind-c", updated.Kind)
+		require.True(t, candidateNextRun.Equal(updated.NextRunAt), "args update changed next_run_at: expected %v got %v", candidateNextRun, updated.NextRunAt)
+
+		paused, err := exec.PeriodicJobPause(ctx, &driver.PeriodicJobPauseParams{ID: "periodic-mutate", Schema: schema})
+		require.NoError(t, err)
+		require.NotNil(t, paused.PausedAt)
+		require.True(t, candidateNextRun.Equal(paused.NextRunAt), "pause changed next_run_at: expected %v got %v", candidateNextRun, paused.NextRunAt)
+
+		resumed, err := exec.PeriodicJobResume(ctx, &driver.PeriodicJobResumeParams{ID: "periodic-mutate", Schema: schema})
+		require.NoError(t, err)
+		require.Nil(t, resumed.PausedAt)
+		require.True(t, candidateNextRun.Equal(resumed.NextRunAt), "resume changed next_run_at: expected %v got %v", candidateNextRun, resumed.NextRunAt)
+
+		_, err = exec.PeriodicJobUpdate(ctx, &driver.PeriodicJobUpdateParams{
+			ID: "missing", Schema: schema, SetQueue: true, Queue: "queue-c",
+		})
+		require.ErrorIs(t, err, rivertype.ErrNotFound)
+	})
+
 	t.Run("PeriodicJobsEnqueueDue", func(t *testing.T) {
 		t.Parallel()
 		exec, schema := execSchema(ctx, t, executorWithTx)
