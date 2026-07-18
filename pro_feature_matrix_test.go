@@ -279,7 +279,7 @@ func TestProFeatureMatrix_CrashedClientLeavesStaleProducerAndReaperCleansIt(t *t
 		ProducerRetentionEnabled:     true,
 		ProducerRetentionInterval:    50 * time.Millisecond,
 		ProducerStaleRetentionPeriod: time.Second,
-		Config:                      river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
+		Config:                       river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
 	})
 
 	stale := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
@@ -381,9 +381,8 @@ func TestProFeatureMatrix_DurablePeriodicJobs_CronFires(t *testing.T) {
 	})
 
 	_, err := client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
-		ID:   "matrix-cron",
-		Kind: "matrix_periodic",
-		Args: []byte(`{}`),
+		ID:      "matrix-cron",
+		JobArgs: matrixPeriodicArgs{},
 		Schedule: &PeriodicJobSchedule{
 			CronExpression: "* * * * *",
 			CronTimezone:   "UTC",
@@ -433,7 +432,7 @@ func TestProFeatureMatrix_DurablePeriodicJobs_PauseResume(t *testing.T) {
 
 	_, err := client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
 		ID:       "matrix-pr",
-		Kind:     "matrix_periodic",
+		JobArgs:  matrixPeriodicArgs{},
 		Schedule: schedule,
 	})
 	require.NoError(t, err)
@@ -451,13 +450,8 @@ func TestProFeatureMatrix_DurablePeriodicJobs_PauseResume(t *testing.T) {
 		t.Fatal("job did not fire before pause")
 	}
 
-	// Pause it via Upsert.
-	paused, err := client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
-		ID:       "matrix-pr",
-		Kind:     "matrix_periodic",
-		Schedule: schedule,
-		Paused:   true,
-	})
+	// Pause it without resubmitting the job definition.
+	paused, err := client.PeriodicJobPause(ctx, "matrix-pr")
 	require.NoError(t, err)
 	require.NotNil(t, paused.PausedAt)
 
@@ -477,13 +471,8 @@ afterPause:
 	case <-time.After(500 * time.Millisecond):
 	}
 
-	// Resume via Upsert.
-	resumed, err := client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
-		ID:       "matrix-pr",
-		Kind:     "matrix_periodic",
-		Schedule: schedule,
-		Paused:   false,
-	})
+	// Resume without changing the stored next run.
+	resumed, err := client.PeriodicJobResume(ctx, "matrix-pr")
 	require.NoError(t, err)
 	require.Nil(t, resumed.PausedAt)
 }
@@ -500,33 +489,44 @@ func TestProFeatureMatrix_DurablePeriodicJobs_UpdateSchedule(t *testing.T) {
 		Config: river.Config{Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}}},
 	})
 
-	// Start as a one-shot.
-	_, err := client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
-		ID:   "matrix-update",
-		Kind: "matrix_periodic",
+	initialNextRun := time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
+	inserted, err := client.PeriodicJobInsert(ctx, &PeriodicJobInsertOpts{
+		ID:      "matrix-update",
+		JobArgs: matrixPeriodicArgs{Note: "initial"},
 		Schedule: &PeriodicJobSchedule{
-			NextRunAt: time.Now().Add(-time.Second),
+			NextRunAt: initialNextRun,
 		},
 	})
 	require.NoError(t, err)
+	require.True(t, initialNextRun.Equal(inserted.NextRunAt))
 
-	// Switch to a cron via re-Add (id-based UPSERT).
+	_, err = client.PeriodicJobInsert(ctx, &PeriodicJobInsertOpts{
+		ID:      "matrix-update",
+		JobArgs: matrixPeriodicArgs{},
+		Schedule: &PeriodicJobSchedule{
+			NextRunAt: initialNextRun,
+		},
+	})
+	require.ErrorIs(t, err, ErrPeriodicJobAlreadyExists)
+
+	argsUpdated, err := client.PeriodicJobUpdate(ctx, "matrix-update", &PeriodicJobUpdateOpts{
+		JobArgs: matrixPeriodicArgs{Note: "updated"},
+	})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"note":"updated"}`, string(argsUpdated.Args))
+	require.True(t, initialNextRun.Equal(argsUpdated.NextRunAt), "args update changed next_run_at")
+
 	cron := "0 0 * * *"
-	_, err = client.PeriodicJobUpsert(ctx, &PeriodicJobUpsertOpts{
-		ID:   "matrix-update",
-		Kind: "matrix_periodic",
+	scheduleUpdated, err := client.PeriodicJobUpdate(ctx, "matrix-update", &PeriodicJobUpdateOpts{
 		Schedule: &PeriodicJobSchedule{
 			CronExpression: cron,
 			CronTimezone:   "UTC",
-			NextRunAt:      time.Now().Add(-time.Second),
 		},
 	})
 	require.NoError(t, err)
-
-	got, err := client.PeriodicJobGet(ctx, "matrix-update")
-	require.NoError(t, err)
-	require.NotNil(t, got.CronExpression)
-	require.Equal(t, "0 0 * * *", *got.CronExpression)
+	require.NotNil(t, scheduleUpdated.CronExpression)
+	require.Equal(t, cron, *scheduleUpdated.CronExpression)
+	require.True(t, scheduleUpdated.NextRunAt.After(time.Now()), "schedule update did not calculate a future next run")
 }
 
 func TestProFeatureMatrix_DurablePeriodicJobs_DisabledGating(t *testing.T) {

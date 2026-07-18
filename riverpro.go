@@ -113,16 +113,19 @@ func (c *Config) WithDefaults() *Config {
 
 type DeadLetterConfig struct{ Enabled bool }
 type DurablePeriodicJobsConfig struct {
-	Enabled               bool
+	Enabled bool
 	// PollOnly disables LISTEN/NOTIFY-based wakeup of the enqueuer
 	// loop. When true the loop polls at PollInterval regardless of
 	// driver support. Useful for drivers without working LISTEN/NOTIFY
 	// or for predictable test timing.
-	PollOnly              bool
-	NextRunAtRatchetFunc  func(nextRunAt, now time.Time) time.Time
-	PollInterval          time.Duration
-	StaleThreshold        time.Duration
-	StartStaggerSpread    time.Duration
+	PollOnly             bool
+	NextRunAtRatchetFunc func(nextRunAt, now time.Time) time.Time
+	PollInterval         time.Duration
+	StaleThreshold       time.Duration
+	// Deprecated: retained for source compatibility. Durable cron schedules now
+	// calculate their first run directly from the cron expression.
+	StartStaggerSpread time.Duration
+	// Deprecated: retained for source compatibility and currently unused.
 	StartStaggerThreshold int
 }
 type ConcurrencyConfig struct {

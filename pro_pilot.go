@@ -20,10 +20,10 @@ import (
 )
 
 const (
-	metadataKeyBatchKey       = "riverpro_batch_key"
-	metadataKeyEphemeral      = "riverpro_ephemeral"
-	metadataKeySequenceKey    = "riverpro_sequence_key"
-	producerShutdownTimeout   = 5 * time.Second
+	metadataKeyBatchKey     = "riverpro_batch_key"
+	metadataKeyEphemeral    = "riverpro_ephemeral"
+	metadataKeySequenceKey  = "riverpro_sequence_key"
+	producerShutdownTimeout = 5 * time.Second
 )
 
 type proPilot[TTx any] struct {
@@ -157,8 +157,8 @@ func (p *proPilot[TTx]) PeriodicJobUpsertMany(ctx context.Context, exec riverdri
 	if p.config == nil || !p.config.DurablePeriodicJobs.Enabled {
 		return p.StandardPilot.PeriodicJobUpsertMany(ctx, exec, params)
 	}
-	// Pro owns the table: the upstream enqueuer must do no work. Calls
-	// from the user side go through Client.PeriodicJobAdd instead.
+	// Pro owns the table: the upstream enqueuer must do no work. User-side
+	// mutations go through the durable periodic job client API.
 	return nil, nil
 }
 

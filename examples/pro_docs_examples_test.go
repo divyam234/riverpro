@@ -179,14 +179,17 @@ func testExampleDurablePeriodicJob(t *testing.T) {
 		return nil
 	}))
 	client := newExampleClient(t, ctx, pool, &riverpro.Config{
-		Config: river.Config{
-			PeriodicJobs: []*river.PeriodicJob{river.NewPeriodicJob(river.PeriodicInterval(time.Hour), func() (river.JobArgs, *river.InsertOpts) {
-				return docsPeriodicArgs{}, nil
-			}, &river.PeriodicJobOpts{ID: "docs_periodic", RunOnStart: true})},
-			Workers: workers,
-		},
+		Config:              river.Config{Workers: workers},
 		DurablePeriodicJobs: riverpro.DurablePeriodicJobsConfig{Enabled: true},
 	})
+	_, err := client.PeriodicJobInsert(ctx, &riverpro.PeriodicJobInsertOpts{
+		ID:      "docs_periodic",
+		JobArgs: docsPeriodicArgs{},
+		Schedule: &riverpro.PeriodicJobSchedule{
+			NextRunAt: time.Now().Add(-time.Second),
+		},
+	})
+	require.NoError(t, err)
 
 	subscribeChan, subscribeCancel := client.Subscribe(river.EventKindJobCompleted)
 	defer subscribeCancel()
