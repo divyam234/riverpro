@@ -477,6 +477,70 @@ afterPause:
 	require.Nil(t, resumed.PausedAt)
 }
 
+func TestProFeatureMatrix_DurablePeriodicJobs_ListIncludesPaused(t *testing.T) {
+	ctx := context.Background()
+	client, _, _ := newMatrixClient(t, ctx, &Config{
+		DurablePeriodicJobs: DurablePeriodicJobsConfig{Enabled: true},
+	})
+
+	_, err := client.PeriodicJobInsert(ctx, &PeriodicJobInsertOpts{
+		ID:      "matrix-list-paused",
+		JobArgs: matrixPeriodicArgs{},
+		Schedule: &PeriodicJobSchedule{
+			CronExpression: "0 * * * *",
+		},
+		Paused: true,
+	})
+	require.NoError(t, err)
+
+	listed, err := client.PeriodicJobList(ctx, nil)
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	require.Equal(t, "matrix-list-paused", listed[0].ID)
+	require.NotNil(t, listed[0].PausedAt)
+}
+
+func TestProFeatureMatrix_DurablePeriodicJobs_ListTxIncludesPaused(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, riversharedtest.TestDatabaseURL())
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	drv := riverpropgxv5.New(pool)
+	schema := riverdbtest.TestSchema(ctx, t, drv, nil)
+	client, err := NewClient(drv, &Config{
+		Config: river.Config{
+			Schema:   schema,
+			TestOnly: true,
+			PollOnly: true,
+		},
+		DurablePeriodicJobs: DurablePeriodicJobsConfig{Enabled: true},
+	})
+	require.NoError(t, err)
+
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+
+	_, err = client.PeriodicJobInsertTx(ctx, tx, &PeriodicJobInsertOpts{
+		ID:      "matrix-list-tx-paused",
+		JobArgs: matrixPeriodicArgs{},
+		Schedule: &PeriodicJobSchedule{
+			CronExpression: "0 * * * *",
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = client.PeriodicJobPauseTx(ctx, tx, "matrix-list-tx-paused")
+	require.NoError(t, err)
+
+	listed, err := client.PeriodicJobListTx(ctx, tx, nil)
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	require.Equal(t, "matrix-list-tx-paused", listed[0].ID)
+	require.NotNil(t, listed[0].PausedAt)
+}
+
 func TestProFeatureMatrix_DurablePeriodicJobs_UpdateSchedule(t *testing.T) {
 	ctx := context.Background()
 	workers := river.NewWorkers()

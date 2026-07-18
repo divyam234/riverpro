@@ -88,7 +88,11 @@ func (c *Client[TTx]) PeriodicJobList(ctx context.Context, opts *PeriodicJobList
 	if opts != nil {
 		max = opts.Max
 	}
-	return c.proDriver.GetProExecutor().PeriodicJobGetAll(ctx, &prodriver.PeriodicJobGetAllParams{Max: max, Schema: c.config.Schema})
+	return c.proDriver.GetProExecutor().PeriodicJobGetAll(ctx, &prodriver.PeriodicJobGetAllParams{
+		IncludePaused: true,
+		Max:           max,
+		Schema:        c.config.Schema,
+	})
 }
 
 // PeriodicJobListTx is the transaction variant of PeriodicJobList.
@@ -100,7 +104,11 @@ func (c *Client[TTx]) PeriodicJobListTx(ctx context.Context, tx TTx, opts *Perio
 	if opts != nil {
 		max = opts.Max
 	}
-	return c.proDriver.UnwrapProExecutor(tx).PeriodicJobGetAll(ctx, &prodriver.PeriodicJobGetAllParams{Max: max, Schema: c.config.Schema})
+	return c.proDriver.UnwrapProExecutor(tx).PeriodicJobGetAll(ctx, &prodriver.PeriodicJobGetAllParams{
+		IncludePaused: true,
+		Max:           max,
+		Schema:        c.config.Schema,
+	})
 }
 
 // PeriodicJobGet returns a single durable periodic job by ID.
