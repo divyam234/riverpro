@@ -81,7 +81,7 @@ func Work[T JobArgsWithBatchOpts, TTx any](ctx context.Context, mw ManyWorker[T]
 	}
 	err = mw.WorkMany(ctx, jobs)
 	if len(jobs) > 1 {
-		completeFetchedPeers(ctx, jobs[1:], err)
+		err = errors.Join(err, completeFetchedPeers(ctx, jobs[1:], err))
 	}
 	return err
 }
@@ -167,13 +167,13 @@ func attemptedBy[T JobArgsWithBatchOpts](job *river.Job[T]) string {
 	return job.AttemptedBy[len(job.AttemptedBy)-1]
 }
 
-func completeFetchedPeers[T JobArgsWithBatchOpts](ctx context.Context, jobs []*river.Job[T], workErr error) {
+func completeFetchedPeers[T JobArgsWithBatchOpts](ctx context.Context, jobs []*river.Job[T], workErr error) error {
 	if len(jobs) == 0 || workErr != nil {
-		return
+		return nil
 	}
 	client, err := riverpro.ClientFromContextSafely[any](ctx)
 	if err != nil || client == nil || client.ProExecutor() == nil {
-		return
+		return nil
 	}
 	ids := make([]int64, 0, len(jobs))
 	for _, job := range jobs {
@@ -182,7 +182,7 @@ func completeFetchedPeers[T JobArgsWithBatchOpts](ctx context.Context, jobs []*r
 		}
 	}
 	if len(ids) == 0 {
-		return
+		return nil
 	}
 	now := time.Now()
 	states := make([]rivertype.JobState, len(ids))
@@ -191,7 +191,11 @@ func completeFetchedPeers[T JobArgsWithBatchOpts](ctx context.Context, jobs []*r
 		states[i] = rivertype.JobStateCompleted
 		finalized[i] = &now
 	}
-	_, _ = client.ProExecutor().JobSetStateIfRunningMany(ctx, &riverdriver.JobSetStateIfRunningManyParams{ID: ids, FinalizedAt: finalized, State: states, Schema: client.Schema()})
+	_, err = client.ProExecutor().JobSetStateIfRunningMany(ctx, &riverdriver.JobSetStateIfRunningManyParams{ID: ids, FinalizedAt: finalized, State: states, Schema: client.Schema()})
+	if err != nil {
+		return fmt.Errorf("riverbatch: complete fetched peers: %w", err)
+	}
+	return nil
 }
 
 type MultiError struct {

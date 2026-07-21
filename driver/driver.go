@@ -1476,7 +1476,7 @@ const periodicJobJSONBuildObject = `json_build_object(
 	'UpdatedAt', updated_at,
 	'PausedAt', paused_at,
 	'Kind', kind,
-	'Args', encode(args::text::bytea, 'base64'),
+	'Args', encode(convert_to(args::text, 'UTF8'), 'base64'),
 	'Queue', queue,
 	'Priority', priority,
 	'MaxAttempts', max_attempts,
@@ -1847,6 +1847,7 @@ func (e *Executor) JobGetAvailableLimited(ctx context.Context, params *JobGetAva
 	schema := base.Schema
 	jobTable := qt(schema, "river_job")
 	jobState := qt(schema, "river_job_state")
+	queueTable := qt(schema, "river_queue")
 	query := fmt.Sprintf(`
 WITH available_partitions AS MATERIALIZED (
 	SELECT DISTINCT partition_key
@@ -1856,6 +1857,7 @@ WITH available_partitions AS MATERIALIZED (
 		WHERE j.state = 'available'::%[3]s
 		  AND j.queue = $1
 		  AND j.scheduled_at <= $2
+		  AND NOT EXISTS (SELECT 1 FROM %[6]s AS q WHERE q.name = $1 AND q.paused_at IS NOT NULL)
 	) available_partition_source
 	WHERE (coalesce(cardinality($5::text[]), 0) = 0 OR partition_key = ANY($5::text[]))
 	  AND ($6::text[] IS NOT NULL OR true)
@@ -1936,11 +1938,12 @@ WITH available_partitions AS MATERIALIZED (
 	  AND j.state = 'available'::%[3]s
 	  AND j.queue = $1
 	  AND j.scheduled_at <= $2
+	  AND NOT EXISTS (SELECT 1 FROM %[6]s AS q WHERE q.name = $1 AND q.paused_at IS NOT NULL)
 	RETURNING j.*
 )
 SELECT coalesce(json_agg(%[5]s ORDER BY j.priority ASC, j.scheduled_at ASC, j.id ASC), '[]'::json)
 FROM updated_jobs AS j
-`, partitionExpr, jobTable, jobState, runningPartitionExpr, jobRowJSONObjectSQL("j"))
+`, partitionExpr, jobTable, jobState, runningPartitionExpr, jobRowJSONObjectSQL("j"), queueTable)
 	jobs, err := scanJSON[[]*rivertype.JobRow](ctx, e.Executor, query,
 		base.Queue,
 		now,
@@ -1987,12 +1990,12 @@ func jobRowJSONObjectSQL(alias string) string {
 		'AttemptedAt', %[1]s.attempted_at,
 		'AttemptedBy', %[1]s.attempted_by,
 		'CreatedAt', %[1]s.created_at,
-		'EncodedArgs', encode(%[1]s.args::text::bytea, 'base64'),
+		'EncodedArgs', encode(convert_to(%[1]s.args::text, 'UTF8'), 'base64'),
 		'Errors', %[1]s.errors,
 		'FinalizedAt', %[1]s.finalized_at,
 		'Kind', %[1]s.kind,
 		'MaxAttempts', %[1]s.max_attempts,
-		'Metadata', encode(%[1]s.metadata::text::bytea, 'base64'),
+		'Metadata', encode(convert_to(%[1]s.metadata::text, 'UTF8'), 'base64'),
 		'Priority', %[1]s.priority,
 		'Queue', %[1]s.queue,
 		'ScheduledAt', %[1]s.scheduled_at,
@@ -2034,9 +2037,9 @@ func (e *Executor) JobDeadLetterDeleteByID(ctx context.Context, params *JobDeadL
 		DELETE FROM %s WHERE id = $1
 		RETURNING json_build_object(
 			'ID', id, 'Attempt', attempt, 'AttemptedAt', attempted_at, 'AttemptedBy', attempted_by,
-			'CreatedAt', created_at, 'EncodedArgs', encode(args::text::bytea, 'base64'), 'Errors', errors,
+			'CreatedAt', created_at, 'EncodedArgs', encode(convert_to(args::text, 'UTF8'), 'base64'), 'Errors', errors,
 			'FinalizedAt', finalized_at, 'Kind', kind, 'MaxAttempts', max_attempts,
-			'Metadata', encode(metadata::text::bytea, 'base64'), 'Priority', priority, 'Queue', queue,
+			'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'Priority', priority, 'Queue', queue,
 			'ScheduledAt', scheduled_at, 'State', state, 'Tags', tags,
 			'UniqueKey', encode(coalesce(unique_key, ''::bytea), 'base64'), 'UniqueStates', unique_states
 		)
@@ -2058,9 +2061,9 @@ func (e *Executor) JobDeadLetterGetAll(ctx context.Context, params *JobDeadLette
 	return scanJSON[[]*rivertype.JobRow](ctx, e.Executor, fmt.Sprintf(`
 		SELECT coalesce(json_agg(json_build_object(
 			'ID', id, 'Attempt', attempt, 'AttemptedAt', attempted_at, 'AttemptedBy', attempted_by,
-			'CreatedAt', created_at, 'EncodedArgs', encode(args::text::bytea, 'base64'), 'Errors', errors,
+			'CreatedAt', created_at, 'EncodedArgs', encode(convert_to(args::text, 'UTF8'), 'base64'), 'Errors', errors,
 			'FinalizedAt', finalized_at, 'Kind', kind, 'MaxAttempts', max_attempts,
-			'Metadata', encode(metadata::text::bytea, 'base64'), 'Priority', priority, 'Queue', queue,
+			'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'Priority', priority, 'Queue', queue,
 			'ScheduledAt', scheduled_at, 'State', state, 'Tags', tags,
 			'UniqueKey', encode(coalesce(unique_key, ''::bytea), 'base64'), 'UniqueStates', unique_states
 		) ORDER BY finalized_at DESC NULLS LAST, id DESC), '[]'::json)
@@ -2078,9 +2081,9 @@ func (e *Executor) JobDeadLetterGetByID(ctx context.Context, params *JobDeadLett
 	return scanJSON[*rivertype.JobRow](ctx, e.Executor, fmt.Sprintf(`
 		SELECT json_build_object(
 			'ID', id, 'Attempt', attempt, 'AttemptedAt', attempted_at, 'AttemptedBy', attempted_by,
-			'CreatedAt', created_at, 'EncodedArgs', encode(args::text::bytea, 'base64'), 'Errors', errors,
+			'CreatedAt', created_at, 'EncodedArgs', encode(convert_to(args::text, 'UTF8'), 'base64'), 'Errors', errors,
 			'FinalizedAt', finalized_at, 'Kind', kind, 'MaxAttempts', max_attempts,
-			'Metadata', encode(metadata::text::bytea, 'base64'), 'Priority', priority, 'Queue', queue,
+			'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'Priority', priority, 'Queue', queue,
 			'ScheduledAt', scheduled_at, 'State', state, 'Tags', tags,
 			'UniqueKey', encode(coalesce(unique_key, ''::bytea), 'base64'), 'UniqueStates', unique_states
 		)
@@ -2146,7 +2149,9 @@ func (e *Executor) JobGetAvailableForBatch(ctx context.Context, params *JobGetAv
 	schema := params.Schema
 	batchKey := params.BatchKey
 	if batchKey == "" && params.BatchLeaderJobID != 0 {
-		_ = e.Executor.QueryRow(ctx, fmt.Sprintf(`SELECT metadata->>'riverpro_batch_key' FROM %s WHERE id = $1`, qt(schema, "river_job")), params.BatchLeaderJobID).Scan(&batchKey)
+		if err := e.Executor.QueryRow(ctx, fmt.Sprintf(`SELECT metadata->>'riverpro_batch_key' FROM %s WHERE id = $1`, qt(schema, "river_job")), params.BatchLeaderJobID).Scan(&batchKey); err != nil {
+			return nil, fmt.Errorf("riverpro driver: load batch leader %d: %w", params.BatchLeaderJobID, err)
+		}
 	}
 	if batchKey == "" {
 		return []*rivertype.JobRow{}, nil
@@ -2944,7 +2949,7 @@ func (e *Executor) ProducerGetByID(ctx context.Context, params *ProducerGetByIDP
 	}
 	if dbAvailable(e) {
 		return scanJSON[*Producer](ctx, e.Executor, fmt.Sprintf(`
-			SELECT json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(metadata::text::bytea, 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
+			SELECT json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
 			FROM %s WHERE id = $1
 		`, qt(params.Schema, "river_producer")), params.ID)
 	}
@@ -2989,14 +2994,14 @@ func (e *Executor) ProducerInsertOrUpdate(ctx context.Context, params *ProducerI
 				INSERT INTO %s (id, client_id, queue_name, max_workers, metadata, paused_at, created_at, updated_at)
 				VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
 				ON CONFLICT (id) DO UPDATE SET client_id = excluded.client_id, queue_name = excluded.queue_name, max_workers = excluded.max_workers, metadata = excluded.metadata, paused_at = excluded.paused_at, updated_at = excluded.updated_at
-				RETURNING json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(metadata::text::bytea, 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
+				RETURNING json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
 			`, qt(schema, "river_producer")), params.ID, params.ClientID, params.QueueName, params.MaxWorkers, string(params.Metadata), params.PausedAt, created, now)
 		}
 		return scanJSON[*Producer](ctx, e.Executor, fmt.Sprintf(`
 			INSERT INTO %s (client_id, queue_name, max_workers, metadata, paused_at, created_at, updated_at)
 			VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
 			ON CONFLICT (client_id, queue_name) DO UPDATE SET max_workers = excluded.max_workers, metadata = excluded.metadata, paused_at = excluded.paused_at, updated_at = excluded.updated_at
-			RETURNING json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(metadata::text::bytea, 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
+			RETURNING json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
 		`, qt(schema, "river_producer")), params.ClientID, params.QueueName, params.MaxWorkers, string(params.Metadata), params.PausedAt, created, now)
 	}
 	compat.Lock()
@@ -3032,7 +3037,7 @@ func (e *Executor) ProducerKeepAlive(ctx context.Context, params *ProducerKeepAl
 		now := nowUTC()
 		return scanJSON[*Producer](ctx, e.Executor, fmt.Sprintf(`
 			UPDATE %s SET updated_at = $1 WHERE id = $2
-			RETURNING json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(metadata::text::bytea, 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
+			RETURNING json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
 		`, qt(params.Schema, "river_producer")), now, params.ID)
 	}
 	return e.ProducerUpdate(ctx, &ProducerUpdateParams{ID: params.ID, Schema: params.Schema, UpdatedAt: ptrTime(nowUTC())})
@@ -3161,7 +3166,7 @@ func (e *Executor) ProducerListByQueue(ctx context.Context, params *ProducerList
 	}
 	if dbAvailable(e) {
 		return scanJSON[[]*ProducerListByQueueResult](ctx, e.Executor, fmt.Sprintf(`
-			SELECT coalesce(json_agg(json_build_object('Producer', json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(metadata::text::bytea, 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at), 'Running', 0) ORDER BY id), '[]'::json)
+			SELECT coalesce(json_agg(json_build_object('Producer', json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at), 'Running', 0) ORDER BY id), '[]'::json)
 			FROM %s
 			WHERE ($1 = '' OR queue_name = $1)
 		`, qt(schema, "river_producer")), q)
@@ -3195,7 +3200,7 @@ func (e *Executor) ProducerUpdate(ctx context.Context, params *ProducerUpdatePar
 				paused_at = CASE WHEN $6 THEN $7 ELSE paused_at END,
 				updated_at = $8
 			WHERE id = $1
-			RETURNING json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(metadata::text::bytea, 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
+			RETURNING json_build_object('ID', id, 'ClientID', client_id, 'QueueName', queue_name, 'MaxWorkers', max_workers, 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'PausedAt', paused_at, 'CreatedAt', created_at, 'UpdatedAt', updated_at)
 		`, qt(params.Schema, "river_producer")), params.ID, params.MaxWorkersDoUpdate, params.MaxWorkers, params.MetadataDoUpdate, string(params.Metadata), params.PausedAtDoUpdate, params.PausedAt, now)
 	}
 	compat.Lock()
@@ -3295,50 +3300,32 @@ func (e *Executor) SequencePromote(ctx context.Context, params *SequencePromoteP
 		if params.Now != nil {
 			now = *params.Now
 		}
-		keys, err := scanJSON[[]string](ctx, e.Executor, fmt.Sprintf(`
-			SELECT coalesce(json_agg(key ORDER BY key), '[]'::json)
-			FROM %s
-			WHERE key = ANY($1::text[])
-		`, qt(schema, "river_job_sequence")), params.Keys)
-		if err != nil {
-			return nil, err
-		}
-		present := map[string]bool{}
-		for _, k := range keys {
-			present[k] = true
-		}
-		for _, k := range params.Keys {
-			if !present[k] {
-				res.SkippedKeys = append(res.SkippedKeys, k)
-				continue
-			}
-			var promotedID int64
-			err := e.Executor.QueryRow(ctx, fmt.Sprintf(`
-				WITH next_job AS MATERIALIZED (
-					SELECT id FROM %s
-					WHERE state = 'pending'::%s AND metadata->>'riverpro_sequence_key' = $1
-					ORDER BY priority ASC, scheduled_at ASC, id ASC
-					LIMIT 1
-					FOR UPDATE SKIP LOCKED
-				), promoted AS (
-					UPDATE %s AS j
-					SET state = CASE WHEN j.scheduled_at <= $2 THEN 'available'::%s ELSE 'scheduled'::%s END
-					FROM next_job
-					WHERE j.id = next_job.id
-					RETURNING j.id
-				)
-				SELECT coalesce((SELECT id FROM promoted), 0)
-			`, qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job_state")), k, now).Scan(&promotedID)
-			if err != nil {
-				return nil, err
-			}
-			if promotedID != 0 || present[k] {
-				res.PromotedKeys = append(res.PromotedKeys, k)
-			} else {
-				res.SkippedKeys = append(res.SkippedKeys, k)
-			}
-		}
-		return res, nil
+		return scanJSON[*SequencePromoteResult](ctx, e.Executor, fmt.Sprintf(`
+			WITH requested AS MATERIALIZED (
+				SELECT DISTINCT key FROM unnest($1::text[]) AS key
+			), present AS MATERIALIZED (
+				SELECT r.key FROM requested AS r JOIN %s AS s USING (key)
+			), next_jobs AS MATERIALIZED (
+				SELECT p.key, candidate.id
+				FROM present AS p
+				LEFT JOIN LATERAL (
+					SELECT j.id FROM %s AS j
+					WHERE j.state = 'pending'::%s AND j.metadata->>'riverpro_sequence_key' = p.key
+					ORDER BY j.priority, j.scheduled_at, j.id
+					LIMIT 1 FOR UPDATE SKIP LOCKED
+				) AS candidate ON true
+			), promoted AS (
+				UPDATE %s AS j
+				SET state = CASE WHEN j.scheduled_at <= $2 THEN 'available'::%s ELSE 'scheduled'::%s END
+				FROM next_jobs AS n WHERE j.id = n.id
+				RETURNING j.id
+			)
+			SELECT json_build_object(
+				'PromotedKeys', coalesce((SELECT json_agg(key ORDER BY key) FROM present), '[]'::json),
+				'SkippedKeys', coalesce((SELECT json_agg(r.key ORDER BY r.key) FROM requested AS r LEFT JOIN present AS p USING (key) WHERE p.key IS NULL), '[]'::json)
+			)
+			FROM (SELECT count(*) FROM promoted) AS promoted_count
+		`, qt(schema, "river_job_sequence"), qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job_state")), params.Keys, now)
 	}
 	res.PromotedKeys = append(res.PromotedKeys, params.Keys...)
 	return res, nil
@@ -3409,7 +3396,7 @@ func (e *Executor) WorkflowAttemptInsert(ctx context.Context, params *WorkflowAt
 			INSERT INTO %s (workflow_id, attempt, reset_history, retry_mode, triggered_by)
 			VALUES ($1, $2, $3, $4, $5::jsonb)
 			ON CONFLICT (workflow_id, attempt) DO UPDATE SET reset_history = excluded.reset_history, retry_mode = excluded.retry_mode, triggered_by = excluded.triggered_by
-			RETURNING json_build_object('WorkflowID', workflow_id, 'Attempt', attempt, 'ResetHistory', reset_history, 'RetryMode', retry_mode, 'TriggeredBy', encode(triggered_by::text::bytea, 'base64'), 'CreatedAt', created_at)
+			RETURNING json_build_object('WorkflowID', workflow_id, 'Attempt', attempt, 'ResetHistory', reset_history, 'RetryMode', retry_mode, 'TriggeredBy', encode(convert_to(triggered_by::text, 'UTF8'), 'base64'), 'CreatedAt', created_at)
 		`, qt(schema, "river_workflow_attempt")), params.WorkflowID, params.Attempt, params.ResetHistory, params.RetryMode, triggered)
 	}
 	a := &WorkflowAttempt{Attempt: params.Attempt, CreatedAt: nowUTC(), ResetHistory: params.ResetHistory, RetryMode: params.RetryMode, TriggeredBy: append([]byte(nil), params.TriggeredBy...), WorkflowID: params.WorkflowID}
@@ -3430,7 +3417,7 @@ func (e *Executor) WorkflowAttemptListByWorkflowID(ctx context.Context, params *
 	schema := params.Schema
 	if dbAvailable(e) {
 		return scanJSON[[]*WorkflowAttempt](ctx, e.Executor, fmt.Sprintf(`
-			SELECT coalesce(json_agg(json_build_object('WorkflowID', workflow_id, 'Attempt', attempt, 'ResetHistory', reset_history, 'RetryMode', retry_mode, 'TriggeredBy', encode(triggered_by::text::bytea, 'base64'), 'CreatedAt', created_at) ORDER BY attempt), '[]'::json)
+			SELECT coalesce(json_agg(json_build_object('WorkflowID', workflow_id, 'Attempt', attempt, 'ResetHistory', reset_history, 'RetryMode', retry_mode, 'TriggeredBy', encode(convert_to(triggered_by::text, 'UTF8'), 'base64'), 'CreatedAt', created_at) ORDER BY attempt), '[]'::json)
 			FROM %s WHERE workflow_id = $1
 		`, qt(schema, "river_workflow_attempt")), params.WorkflowID)
 	}
@@ -3459,7 +3446,7 @@ func (e *Executor) WorkflowAttemptTaskInsert(ctx context.Context, params *Workfl
 			INSERT INTO %s (workflow_id, attempt, task, job_id, state, attempt_count, metadata, finalized_at)
 			VALUES ($1, $2, $3, $4, $5::%s, $6, $7::jsonb, $8)
 			ON CONFLICT (workflow_id, attempt, task) DO UPDATE SET job_id = excluded.job_id, state = excluded.state, attempt_count = excluded.attempt_count, metadata = excluded.metadata, finalized_at = excluded.finalized_at
-			RETURNING json_build_object('WorkflowID', workflow_id, 'Attempt', attempt, 'Task', task, 'JobID', job_id, 'State', state, 'AttemptCount', attempt_count, 'Metadata', encode(metadata::text::bytea, 'base64'), 'FinalizedAt', finalized_at, 'Errors', errors)
+			RETURNING json_build_object('WorkflowID', workflow_id, 'Attempt', attempt, 'Task', task, 'JobID', job_id, 'State', state, 'AttemptCount', attempt_count, 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'FinalizedAt', finalized_at, 'Errors', errors)
 		`, qt(schema, "river_workflow_attempt_task"), qt(schema, "river_job_state")), params.WorkflowID, params.Attempt, params.Task, params.JobID, params.State, params.AttemptCount, meta, params.FinalizedAt)
 	}
 	at := &WorkflowAttemptTask{Attempt: params.Attempt, AttemptCount: params.AttemptCount, FinalizedAt: params.FinalizedAt, JobID: params.JobID, Metadata: append([]byte(nil), params.Metadata...), State: params.State, Task: params.Task, WorkflowID: params.WorkflowID}
@@ -3480,7 +3467,7 @@ func (e *Executor) WorkflowAttemptTaskListByWorkflowID(ctx context.Context, para
 	schema := params.Schema
 	if dbAvailable(e) {
 		return scanJSON[[]*WorkflowAttemptTask](ctx, e.Executor, fmt.Sprintf(`
-			SELECT coalesce(json_agg(json_build_object('WorkflowID', workflow_id, 'Attempt', attempt, 'Task', task, 'JobID', job_id, 'State', state, 'AttemptCount', attempt_count, 'Metadata', encode(metadata::text::bytea, 'base64'), 'FinalizedAt', finalized_at, 'Errors', errors) ORDER BY task), '[]'::json)
+			SELECT coalesce(json_agg(json_build_object('WorkflowID', workflow_id, 'Attempt', attempt, 'Task', task, 'JobID', job_id, 'State', state, 'AttemptCount', attempt_count, 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'FinalizedAt', finalized_at, 'Errors', errors) ORDER BY task), '[]'::json)
 			FROM %s WHERE workflow_id = $1 AND ($2::int = 0 OR attempt = $2)
 		`, qt(schema, "river_workflow_attempt_task")), params.WorkflowID, params.Attempt)
 	}
@@ -3604,7 +3591,9 @@ func (e *Executor) WorkflowCleanupDeleteJobsByWorkflowIDs(ctx context.Context, p
 		for _, j := range jobs {
 			ids = append(ids, j.ID)
 		}
-		_, _ = e.JobDeleteByIDMany(ctx, &JobDeleteByIDManyParams{ID: ids, Schema: params.Schema})
+		if _, err := e.JobDeleteByIDMany(ctx, &JobDeleteByIDManyParams{ID: ids, Schema: params.Schema}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -3798,7 +3787,7 @@ func (e *Executor) WorkflowGetByID(ctx context.Context, params *WorkflowGetByIDP
 	schema := params.Schema
 	if dbAvailable(e) {
 		return scanJSON[*Workflow](ctx, e.Executor, fmt.Sprintf(`
-			SELECT json_build_object('ID', id, 'Name', name, 'State', state, 'Metadata', encode(metadata::text::bytea, 'base64'), 'CurrentAttempt', current_attempt, 'CreatedAt', created_at, 'UpdatedAt', updated_at, 'FinalizedAt', finalized_at, 'WaitEvalCursorJobID', wait_eval_cursor_job_id)
+			SELECT json_build_object('ID', id, 'Name', name, 'State', state, 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'CurrentAttempt', current_attempt, 'CreatedAt', created_at, 'UpdatedAt', updated_at, 'FinalizedAt', finalized_at, 'WaitEvalCursorJobID', wait_eval_cursor_job_id)
 			FROM %s WHERE id = $1
 		`, qt(schema, "river_workflow")), params.WorkflowID)
 	}
@@ -3887,25 +3876,14 @@ func (e *Executor) WorkflowInsertMany(ctx context.Context, params *WorkflowInser
 	schema := params.Schema
 	if dbAvailable(e) {
 		now := nowUTC()
-		for i, id := range params.IDs {
-			if id == "" {
-				continue
-			}
-			var name *string
-			if i < len(params.Names) && params.Names[i] != "" {
-				n := params.Names[i]
-				name = &n
-			}
-			err := e.Executor.Exec(ctx, fmt.Sprintf(`
-				INSERT INTO %s (id, name, state, current_attempt, created_at, updated_at)
-				VALUES ($1, $2, 'active', 1, $3, $3)
-				ON CONFLICT (id) DO UPDATE SET name = coalesce(excluded.name, %s.name), updated_at = excluded.updated_at
-			`, qt(schema, "river_workflow"), qt(schema, "river_workflow")), id, name, now)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
+		return e.Executor.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO %s AS w (id, name, state, current_attempt, created_at, updated_at)
+			SELECT ids.id, nullif(names.name, ''), 'active', 1, $3, $3
+			FROM unnest($1::text[]) WITH ORDINALITY AS ids(id, ord)
+			LEFT JOIN unnest($2::text[]) WITH ORDINALITY AS names(name, ord) USING (ord)
+			WHERE ids.id <> ''
+			ON CONFLICT (id) DO UPDATE SET name = coalesce(excluded.name, w.name), updated_at = excluded.updated_at
+		`, qt(schema, "river_workflow")), params.IDs, params.Names, now)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -4278,7 +4256,7 @@ func (e *Executor) WorkflowSignalInsert(ctx context.Context, params *WorkflowSig
 		if params.IdempotencyKey != "" {
 			existing, err := scanJSON[*WorkflowSignalInsertResult](ctx, e.Executor, fmt.Sprintf(`
 				SELECT json_build_object('ID', id, 'WorkflowID', workflow_id, 'Attempt', attempt, 'Key', key, 'IdempotencyKey', idempotency_key,
-					'Payload', encode(payload::text::bytea, 'base64'), 'Metadata', encode(metadata::text::bytea, 'base64'), 'Source', encode(source::text::bytea, 'base64'),
+					'Payload', encode(convert_to(payload::text, 'UTF8'), 'base64'), 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'Source', encode(convert_to(source::text, 'UTF8'), 'base64'),
 					'CreatedAt', created_at, 'CurrentAttempt', $4::int, 'PayloadSemanticEqual', payload = $5::jsonb, 'SignalPresent', true, 'SkippedAsDuplicate', true)
 				FROM %s WHERE workflow_id = $1 AND attempt = $2 AND idempotency_key = $3
 			`, qt(schema, "river_workflow_signal")), params.WorkflowID, attempt, params.IdempotencyKey, cur, payload)
@@ -4293,7 +4271,7 @@ func (e *Executor) WorkflowSignalInsert(ctx context.Context, params *WorkflowSig
 			INSERT INTO %s (workflow_id, attempt, key, idempotency_key, payload, metadata, source)
 			VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb)
 			RETURNING json_build_object('ID', id, 'WorkflowID', workflow_id, 'Attempt', attempt, 'Key', key, 'IdempotencyKey', idempotency_key,
-				'Payload', encode(payload::text::bytea, 'base64'), 'Metadata', encode(metadata::text::bytea, 'base64'), 'Source', encode(source::text::bytea, 'base64'),
+				'Payload', encode(convert_to(payload::text, 'UTF8'), 'base64'), 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'Source', encode(convert_to(source::text, 'UTF8'), 'base64'),
 				'CreatedAt', created_at, 'CurrentAttempt', $8::int, 'PayloadSemanticEqual', true, 'SignalPresent', true, 'SkippedAsDuplicate', false)
 		`, qt(schema, "river_workflow_signal")), params.WorkflowID, attempt, params.Key, params.IdempotencyKey, payload, metadata, source, cur)
 		return res, err
@@ -4394,7 +4372,7 @@ func (e *Executor) WorkflowSignalList(ctx context.Context, params *WorkflowSigna
 		}
 		return scanJSON[[]*WorkflowSignal](ctx, e.Executor, fmt.Sprintf(`
 			SELECT coalesce(json_agg(json_build_object('ID', id, 'WorkflowID', workflow_id, 'Attempt', attempt, 'Key', key, 'IdempotencyKey', idempotency_key,
-				'Payload', encode(payload::text::bytea, 'base64'), 'Metadata', encode(metadata::text::bytea, 'base64'), 'Source', encode(source::text::bytea, 'base64'), 'CreatedAt', created_at) ORDER BY id %s), '[]'::json)
+				'Payload', encode(convert_to(payload::text, 'UTF8'), 'base64'), 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'Source', encode(convert_to(source::text, 'UTF8'), 'base64'), 'CreatedAt', created_at) ORDER BY id %s), '[]'::json)
 			FROM (SELECT * FROM %s WHERE workflow_id = $1 AND ($2::int = 0 OR attempt = $2) AND ($3 = '' OR key = $3) AND ($4::bigint = 0 OR id %s $4) ORDER BY id %s LIMIT $5) s
 		`, order, qt(schema, "river_workflow_signal"), op, order), params.WorkflowID, attempt, key, cursor, limit)
 	}
@@ -4432,7 +4410,7 @@ func (e *Executor) WorkflowSignalListByKeys(ctx context.Context, params *Workflo
 		}
 		return scanJSON[[]*WorkflowSignal](ctx, e.Executor, fmt.Sprintf(`
 			SELECT coalesce(json_agg(json_build_object('ID', id, 'WorkflowID', workflow_id, 'Attempt', attempt, 'Key', key, 'IdempotencyKey', idempotency_key,
-				'Payload', encode(payload::text::bytea, 'base64'), 'Metadata', encode(metadata::text::bytea, 'base64'), 'Source', encode(source::text::bytea, 'base64'), 'CreatedAt', created_at) ORDER BY id %s), '[]'::json)
+				'Payload', encode(convert_to(payload::text, 'UTF8'), 'base64'), 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'Source', encode(convert_to(source::text, 'UTF8'), 'base64'), 'CreatedAt', created_at) ORDER BY id %s), '[]'::json)
 			FROM (SELECT * FROM %s WHERE workflow_id = $1 AND ($2::int = 0 OR attempt = $2) AND (cardinality($3::text[]) = 0 OR key = ANY($3::text[])) AND ($4::bigint = 0 OR id %s $4) ORDER BY id %s LIMIT $5) s
 		`, order, qt(schema, "river_workflow_signal"), op, order), params.WorkflowID, attempt, params.Keys, cursor, limit)
 	}
@@ -4448,7 +4426,7 @@ func (e *Executor) WorkflowSignalListByWorkflowIDs(ctx context.Context, params *
 	if dbAvailable(e) {
 		return scanJSON[[]*WorkflowSignal](ctx, e.Executor, fmt.Sprintf(`
 			SELECT coalesce(json_agg(json_build_object('ID', id, 'WorkflowID', workflow_id, 'Attempt', attempt, 'Key', key, 'IdempotencyKey', idempotency_key,
-				'Payload', encode(payload::text::bytea, 'base64'), 'Metadata', encode(metadata::text::bytea, 'base64'), 'Source', encode(source::text::bytea, 'base64'), 'CreatedAt', created_at) ORDER BY workflow_id, id), '[]'::json)
+				'Payload', encode(convert_to(payload::text, 'UTF8'), 'base64'), 'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'Source', encode(convert_to(source::text, 'UTF8'), 'base64'), 'CreatedAt', created_at) ORDER BY workflow_id, id), '[]'::json)
 			FROM %s WHERE workflow_id = ANY($1::text[]) AND ($2::int = 0 OR attempt = $2) AND (cardinality($3::text[]) = 0 OR key = ANY($3::text[]))
 		`, qt(schema, "river_workflow_signal")), params.WorkflowIDs, params.Attempt, params.Keys)
 	}
@@ -4497,6 +4475,16 @@ func (e *Executor) WorkflowSignalStatsByWorkflowIDs(ctx context.Context, params 
 func (e *Executor) WorkflowStageJobsByIDMany(ctx context.Context, params *WorkflowStageJobsByIDManyParams) ([]*rivertype.JobRow, error) {
 	if params == nil || len(params.JobIDs) == 0 {
 		return []*rivertype.JobRow{}, nil
+	}
+	if dbAvailable(e) {
+		return scanJSON[[]*rivertype.JobRow](ctx, e.Executor, fmt.Sprintf(`
+			WITH updated AS (
+				UPDATE %s SET state = 'available'::%s, scheduled_at = $2
+				WHERE id = ANY($1::bigint[]) AND state = 'pending'::%s
+				RETURNING *
+			)
+			SELECT coalesce(json_agg(%s ORDER BY j.id), '[]'::json) FROM updated AS j
+		`, qt(params.Schema, "river_job"), qt(params.Schema, "river_job_state"), qt(params.Schema, "river_job_state"), jobRowJSONObjectSQL("j")), params.JobIDs, params.WorkflowStagedAt)
 	}
 	out := []*rivertype.JobRow{}
 	for _, id := range params.JobIDs {
@@ -4598,15 +4586,14 @@ func (e *Executor) WorkflowTimerUpsertMany(ctx context.Context, params *Workflow
 	}
 	schema := params.Schema
 	if dbAvailable(e) {
-		for i, id := range params.WorkflowIDs {
-			if i >= len(params.NextFireAts) || id == "" {
-				continue
-			}
-			if err := e.Executor.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (workflow_id, next_fire_at) VALUES ($1, $2) ON CONFLICT (workflow_id) DO UPDATE SET next_fire_at = excluded.next_fire_at`, qt(schema, "river_workflow_timer")), id, params.NextFireAts[i]); err != nil {
-				return err
-			}
-		}
-		return nil
+		return e.Executor.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO %s (workflow_id, next_fire_at)
+			SELECT ids.id, fires.fire_at
+			FROM unnest($1::text[]) WITH ORDINALITY AS ids(id, ord)
+			JOIN unnest($2::timestamptz[]) WITH ORDINALITY AS fires(fire_at, ord) USING (ord)
+			WHERE ids.id <> ''
+			ON CONFLICT (workflow_id) DO UPDATE SET next_fire_at = excluded.next_fire_at
+		`, qt(schema, "river_workflow_timer")), params.WorkflowIDs, params.NextFireAts)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -4722,15 +4709,15 @@ func (e *Executor) WorkflowWaitEvalCursorUpdateByWorkflowIDMany(ctx context.Cont
 	}
 	schema := params.Schema
 	if dbAvailable(e) {
-		for i, id := range params.WorkflowIDs {
-			if i >= len(params.CursorJobIDs) || id == "" {
-				continue
-			}
-			if err := e.Executor.Exec(ctx, fmt.Sprintf(`UPDATE %s SET wait_eval_cursor_job_id = $1, updated_at = now() WHERE id = $2`, qt(schema, "river_workflow")), params.CursorJobIDs[i], id); err != nil {
-				return err
-			}
-		}
-		return nil
+		return e.Executor.Exec(ctx, fmt.Sprintf(`
+			UPDATE %s AS w SET wait_eval_cursor_job_id = pairs.cursor_id, updated_at = now()
+			FROM (
+				SELECT ids.id, cursors.cursor_id
+				FROM unnest($1::text[]) WITH ORDINALITY AS ids(id, ord)
+				JOIN unnest($2::bigint[]) WITH ORDINALITY AS cursors(cursor_id, ord) USING (ord)
+			) AS pairs
+			WHERE w.id = pairs.id AND pairs.id <> ''
+		`, qt(schema, "river_workflow")), params.WorkflowIDs, params.CursorJobIDs)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -4749,6 +4736,25 @@ func (e *Executor) WorkflowWaitEvalCursorUpdateByWorkflowIDMany(ctx context.Cont
 func (e *Executor) WorkflowWaitUpdateMetadataByJobIDMany(ctx context.Context, params *WorkflowWaitUpdateMetadataByJobIDManyParams) error {
 	if params == nil {
 		return nil
+	}
+	if dbAvailable(e) {
+		states := make([]string, len(params.JobIDs))
+		for i := range states {
+			if i < len(params.WaitStates) && len(params.WaitStates[i]) > 0 {
+				states[i] = string(params.WaitStates[i])
+			} else {
+				states[i] = "{}"
+			}
+		}
+		return e.Executor.Exec(ctx, fmt.Sprintf(`
+			UPDATE %s AS j SET metadata = j.metadata || pairs.wait_state
+			FROM (
+				SELECT ids.id, states.wait_state::jsonb
+				FROM unnest($1::bigint[]) WITH ORDINALITY AS ids(id, ord)
+				JOIN unnest($2::text[]) WITH ORDINALITY AS states(wait_state, ord) USING (ord)
+			) AS pairs
+			WHERE j.id = pairs.id
+		`, qt(params.Schema, "river_job")), params.JobIDs, states)
 	}
 	for i, id := range params.JobIDs {
 		var meta []byte
@@ -4791,15 +4797,11 @@ func (e *Executor) WorkflowWorklistInsertMany(ctx context.Context, params *Workf
 	}
 	schema := params.Schema
 	if dbAvailable(e) {
-		for _, id := range params.WorkflowIDs {
-			if id == "" {
-				continue
-			}
-			if err := e.Executor.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (workflow_id, reason) VALUES ($1, $2) ON CONFLICT (workflow_id, reason) DO NOTHING`, qt(schema, "river_workflow_worklist")), id, params.Reason); err != nil {
-				return err
-			}
-		}
-		return nil
+		return e.Executor.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO %s (workflow_id, reason)
+			SELECT id, $2 FROM unnest($1::text[]) AS id WHERE id <> ''
+			ON CONFLICT (workflow_id, reason) DO NOTHING
+		`, qt(schema, "river_workflow_worklist")), params.WorkflowIDs, params.Reason)
 	}
 	compat.Lock()
 	defer compat.Unlock()

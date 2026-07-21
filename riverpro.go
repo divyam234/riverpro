@@ -459,7 +459,9 @@ func (c *Client[TTx]) workflowEvaluateReady(ctx context.Context) error {
 				return err
 			}
 		}
-		_, _ = exec.WorkflowFinalizeIfCompleteMany(ctx, &prodriver.WorkflowFinalizeIfCompleteManyParams{Now: time.Now(), Schema: c.config.Schema, WorkflowIDs: []string{item.ID}})
+		if _, err := exec.WorkflowFinalizeIfCompleteMany(ctx, &prodriver.WorkflowFinalizeIfCompleteManyParams{Now: time.Now(), Schema: c.config.Schema, WorkflowIDs: []string{item.ID}}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1247,7 +1249,9 @@ func (w *WorkflowT[TTx]) PrepareTx(ctx context.Context, tx TTx) (*WorkflowPrepar
 		if !isZeroValue(tx) {
 			exec = w.client.proDriver.UnwrapProExecutor(tx)
 		}
-		_ = exec.WorkflowInsertMany(ctx, &prodriver.WorkflowInsertManyParams{IDs: []string{w.ID()}, Names: []string{w.Name()}, Schema: w.client.config.Schema})
+		if err := exec.WorkflowInsertMany(ctx, &prodriver.WorkflowInsertManyParams{IDs: []string{w.ID()}, Names: []string{w.Name()}, Schema: w.client.config.Schema}); err != nil {
+			return nil, fmt.Errorf("riverpro: persist workflow %q: %w", w.ID(), err)
+		}
 	}
 	jobs := make([]river.InsertManyParams, 0, len(w.tasks))
 	for _, t := range w.tasks {
@@ -1421,22 +1425,21 @@ func (w *WorkflowT[TTx]) LoadDepsTx(ctx context.Context, tx TTx, taskName string
 		if err != nil {
 			return nil, err
 		}
-		names := make([]string, 0, len(m))
-		for name := range m {
-			names = append(names, name)
+		jobIDs := make([]int64, 0, len(m))
+		for _, id := range m {
+			if id != nil {
+				jobIDs = append(jobIDs, *id)
+			}
 		}
-		rows, err := exec.WorkflowLoadTasksByNames(ctx, &prodriver.WorkflowLoadTasksByNamesParams{Schema: w.client.config.Schema, TaskNames: names, WorkflowID: w.ID()})
+		rows, err := exec.WorkflowLoadJobsWithDeps(ctx, &prodriver.WorkflowLoadJobsWithDepsParams{JobIds: jobIDs, Schema: w.client.config.Schema})
 		if err != nil {
 			return nil, err
 		}
 		out := &WorkflowTasks{byName: map[string]*WorkflowTaskWithJob{}}
 		for _, row := range rows {
-			if row == nil {
-				continue
-			}
-			job, err := exec.WorkflowJobGetByTaskName(ctx, &prodriver.WorkflowJobGetByTaskNameParams{Schema: w.client.config.Schema, TaskName: row.Task, WorkflowID: row.WorkflowID})
-			if err == nil {
-				out.byName[row.Task] = workflowTaskFromJob(job)
+			task := workflowTaskFromPro(row)
+			if task != nil && task.Name != "" {
+				out.byName[task.Name] = task
 			}
 		}
 		return out, nil
@@ -1582,7 +1585,9 @@ func (w *WorkflowT[TTx]) SignalTx(ctx context.Context, tx TTx, key string, paylo
 	if opts != nil && opts.Attempt != nil && row.CurrentAttempt != 0 && *opts.Attempt != row.CurrentAttempt {
 		return nil, &riverworkflow.SignalAttemptMismatchError{RequestedAttempt: *opts.Attempt, SignalAttempt: row.CurrentAttempt, WorkflowID: row.WorkflowID}
 	}
-	_ = w.client.workflowEvaluateReady(ctx)
+	if err := w.client.workflowEvaluateReady(ctx); err != nil {
+		return nil, fmt.Errorf("riverpro: evaluate workflow after signal: %w", err)
+	}
 	return &WorkflowSignalResult{Attempt: row.Attempt, CreatedAt: row.CreatedAt, ID: row.ID, IdempotencyKey: row.IdempotencyKey, Key: row.Key, SkippedAsDuplicate: row.SkippedAsDuplicate, WorkflowID: row.WorkflowID}, nil
 }
 func (w *WorkflowT[TTx]) SignalList(ctx context.Context, opts *WorkflowSignalListParams) (*WorkflowSignalListResult, error) {

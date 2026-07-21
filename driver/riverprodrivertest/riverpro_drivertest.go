@@ -694,10 +694,13 @@ func exerciseWorkflowSignals[TTx any](ctx context.Context, t *testing.T,
 
 		_, err = exec.WorkflowSignalInsert(ctx, &driver.WorkflowSignalInsertParams{Key: "other", Payload: []byte(`{"n":2}`), Schema: schema, WorkflowID: "wf-signal"})
 		require.NoError(t, err)
+		_, err = exec.WorkflowSignalInsert(ctx, &driver.WorkflowSignalInsertParams{Key: "escaped", Payload: []byte(`{"path":"C:\\tmp\\file","expr":"signals[\"ready\"]"}`), Metadata: []byte(`{"note":"backslash \\ value"}`), Schema: schema, WorkflowID: "wf-signal"})
+		require.NoError(t, err)
 
 		listed, err := exec.WorkflowSignalList(ctx, &driver.WorkflowSignalListParams{LimitCount: 10, Schema: schema, WorkflowID: "wf-signal"})
 		require.NoError(t, err)
-		require.Equal(t, []string{"ready", "other"}, signalKeys(listed))
+		require.Equal(t, []string{"ready", "other", "escaped"}, signalKeys(listed))
+		require.JSONEq(t, `{"path":"C:\\tmp\\file","expr":"signals[\"ready\"]"}`, string(listed[2].Payload))
 
 		key := "ready"
 		byKey, err := exec.WorkflowSignalList(ctx, &driver.WorkflowSignalListParams{Key: &key, LimitCount: 10, Schema: schema, WorkflowID: "wf-signal"})
@@ -888,6 +891,23 @@ func exerciseConcurrencyLimits[TTx any](ctx context.Context, t *testing.T,
 		jobs := fetch(ctx, t, exec, schema, "client-filter", &driver.JobGetAvailableLimitedParams{GlobalLimit: 5, PartitionByKind: true, AvailablePartitionKeys: []string{"kind=filter-a"}})
 		require.Len(t, jobs, 1)
 		require.Equal(t, kindA.ID, jobs[0].ID)
+	})
+
+	t.Run("ConcurrencyLimitedFetchRespectsPausedQueue", func(t *testing.T) {
+		t.Parallel()
+		exec, schema := execSchema(ctx, t, executorWithTx)
+		available := insertJob(ctx, t, exec, schema, "paused-kind", rivertype.JobStateAvailable, []byte(`{}`), []byte(`{}`), nil)
+		now := time.Now().UTC()
+		_, err := exec.QueueCreateOrSetUpdatedAt(ctx, &riverdriver.QueueCreateOrSetUpdatedAtParams{Name: "default", Metadata: []byte(`{}`), Now: &now, Schema: schema})
+		require.NoError(t, err)
+		require.NoError(t, exec.QueuePause(ctx, &riverdriver.QueuePauseParams{Name: "default", Now: &now, Schema: schema}))
+
+		jobs := fetch(ctx, t, exec, schema, "client-paused", &driver.JobGetAvailableLimitedParams{GlobalLimit: 1})
+		require.Empty(t, jobs, "paused queue must not claim available jobs")
+
+		stored, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: available.ID, Schema: schema})
+		require.NoError(t, err)
+		require.Equal(t, rivertype.JobStateAvailable, stored.State)
 	})
 
 	t.Run("ConcurrencyLengthMismatchReturnsError", func(t *testing.T) {

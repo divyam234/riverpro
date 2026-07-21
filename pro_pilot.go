@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -26,6 +27,12 @@ const (
 	producerShutdownTimeout = 5 * time.Second
 )
 
+type sequenceInsertJob struct {
+	job   *riverdriver.JobInsertFastParams
+	queue string
+	key   string
+}
+
 type proPilot[TTx any] struct {
 	riverpilot.StandardPilot
 	config *Config
@@ -46,7 +53,8 @@ func (p *proPilot[TTx]) JobInsertMany(ctx context.Context, exec riverdriver.Exec
 	if params == nil || len(params.Jobs) == 0 {
 		return p.StandardPilot.JobInsertMany(ctx, exec, params)
 	}
-	sequenceSeen := map[string]int{}
+
+	sequenceJobs := make([]sequenceInsertJob, 0, len(params.Jobs))
 	sequenceKeys := make([]string, 0, len(params.Jobs))
 	for _, job := range params.Jobs {
 		if job == nil {
@@ -62,15 +70,8 @@ func (p *proPilot[TTx]) JobInsertMany(ctx context.Context, exec riverdriver.Exec
 		if seqArgs, ok := job.Args.(JobArgsWithSequenceOpts); ok {
 			seqKey := sequenceKey(job.Queue, job.Kind, job.EncodedArgs, seqArgs.SequenceOpts(), job.Args)
 			meta[metadataKeySequenceKey] = seqKey
+			sequenceJobs = append(sequenceJobs, sequenceInsertJob{job: job, queue: job.Queue, key: seqKey})
 			sequenceKeys = append(sequenceKeys, seqKey)
-			active, err := sequenceActiveCount(ctx, exec, params.Schema, job.Queue, seqKey)
-			if err != nil {
-				return nil, err
-			}
-			if active+sequenceSeen[seqKey] > 0 && job.State != rivertype.JobStateScheduled {
-				job.State = rivertype.JobStatePending
-			}
-			sequenceSeen[seqKey]++
 		}
 		data, err := json.Marshal(meta)
 		if err != nil {
@@ -78,6 +79,20 @@ func (p *proPilot[TTx]) JobInsertMany(ctx context.Context, exec riverdriver.Exec
 		}
 		job.Metadata = data
 	}
+
+	activeCounts, err := sequenceActiveCounts(ctx, exec, params.Schema, sequenceJobs)
+	if err != nil {
+		return nil, err
+	}
+	sequenceSeen := make(map[string]int, len(sequenceJobs))
+	for _, item := range sequenceJobs {
+		lookupKey := sequenceLookupKey(item.queue, item.key)
+		if activeCounts[lookupKey]+sequenceSeen[lookupKey] > 0 && item.job.State != rivertype.JobStateScheduled {
+			item.job.State = rivertype.JobStatePending
+		}
+		sequenceSeen[lookupKey]++
+	}
+
 	if len(sequenceKeys) > 0 && p.driver != nil {
 		_, err := (&prodriver.Executor{Executor: exec}).SequenceAppendMany(ctx, &prodriver.SequenceAppendManyParams{Schema: params.Schema, SeqKeys: sequenceKeys})
 		if err != nil {
@@ -111,6 +126,7 @@ func (p *proPilot[TTx]) JobSetStateIfRunningMany(ctx context.Context, exec river
 	}
 	pe := &prodriver.Executor{Executor: exec}
 	sequenceKeys := map[string]bool{}
+	var postErr error
 	for _, job := range updated {
 		if job == nil {
 			continue
@@ -120,10 +136,14 @@ func (p *proPilot[TTx]) JobSetStateIfRunningMany(ctx context.Context, exec river
 			sequenceKeys[key] = true
 		}
 		if isTruthy(meta[metadataKeyEphemeral]) && job.State == rivertype.JobStateCompleted {
-			_, _ = exec.JobDelete(ctx, &riverdriver.JobDeleteParams{ID: job.ID, Schema: schemaFromParams(params)})
+			if _, deleteErr := exec.JobDelete(ctx, &riverdriver.JobDeleteParams{ID: job.ID, Schema: schemaFromParams(params)}); deleteErr != nil {
+				postErr = errors.Join(postErr, fmt.Errorf("delete ephemeral job %d: %w", job.ID, deleteErr))
+			}
 		}
 		if p.config != nil && p.config.DeadLetter.Enabled && job.State == rivertype.JobStateDiscarded {
-			_ = copyJobToDeadLetter(ctx, exec, schemaFromParams(params), job.ID)
+			if deadErr := copyJobToDeadLetter(ctx, exec, schemaFromParams(params), job.ID); deadErr != nil {
+				postErr = errors.Join(postErr, fmt.Errorf("copy discarded job %d to dead letter: %w", job.ID, deadErr))
+			}
 		}
 	}
 	if len(sequenceKeys) > 0 {
@@ -132,9 +152,11 @@ func (p *proPilot[TTx]) JobSetStateIfRunningMany(ctx context.Context, exec river
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
-		_, _ = pe.SequencePromote(ctx, &prodriver.SequencePromoteParams{Keys: keys, Schema: schemaFromParams(params), Now: ptrTimeProPilot(time.Now())})
+		if _, promoteErr := pe.SequencePromote(ctx, &prodriver.SequencePromoteParams{Keys: keys, Schema: schemaFromParams(params), Now: ptrTimeProPilot(time.Now())}); promoteErr != nil {
+			postErr = errors.Join(postErr, fmt.Errorf("promote completed sequences: %w", promoteErr))
+		}
 	}
-	return updated, nil
+	return updated, postErr
 }
 
 func (p *proPilot[TTx]) PeriodicJobGetAll(ctx context.Context, exec riverdriver.Executor, params *riverpilot.PeriodicJobGetAllParams) ([]*riverpilot.PeriodicJob, error) {
@@ -314,17 +336,67 @@ func stableKey(parts ...string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func sequenceActiveCount(ctx context.Context, exec riverdriver.Executor, schema, queue, key string) (int, error) {
-	if exec == nil || key == "" {
-		return 0, nil
+func sequenceActiveCounts(ctx context.Context, exec riverdriver.Executor, schema string, jobs []sequenceInsertJob) (map[string]int, error) {
+	counts := make(map[string]int)
+	if exec == nil || len(jobs) == 0 {
+		return counts, nil
 	}
-	query := fmt.Sprintf(`SELECT count(*) FROM %s WHERE queue = $1 AND metadata->>$2 = $3 AND state IN ('available','running','retryable','scheduled','pending')`, qTableName(schema, "river_job"))
-	row := exec.QueryRow(ctx, query, queue, metadataKeySequenceKey, key)
-	var count int
-	if err := row.Scan(&count); err != nil {
-		return 0, err
+	type lookup struct {
+		Queue string `json:"queue"`
+		Key   string `json:"key"`
 	}
-	return count, nil
+	unique := make(map[string]lookup, len(jobs))
+	for _, item := range jobs {
+		if item.key == "" {
+			continue
+		}
+		unique[sequenceLookupKey(item.queue, item.key)] = lookup{Queue: item.queue, Key: item.key}
+	}
+	lookups := make([]lookup, 0, len(unique))
+	for _, item := range unique {
+		lookups = append(lookups, item)
+	}
+	payload, err := json.Marshal(lookups)
+	if err != nil {
+		return nil, err
+	}
+	type countRow struct {
+		Queue string `json:"queue"`
+		Key   string `json:"key"`
+		Count int    `json:"count"`
+	}
+	var encodedCounts []byte
+	err = exec.QueryRow(ctx, fmt.Sprintf(`
+		WITH requested AS (
+			SELECT queue, key
+			FROM jsonb_to_recordset($1::jsonb) AS x(queue text, key text)
+		), grouped AS (
+			SELECT r.queue, r.key, count(j.id)::integer AS count
+			FROM requested AS r
+			LEFT JOIN %s AS j
+			  ON j.queue = r.queue
+			 AND j.metadata->>$2 = r.key
+			 AND j.state IN ('available','running','retryable','scheduled','pending')
+			GROUP BY r.queue, r.key
+		)
+		SELECT coalesce(json_agg(grouped ORDER BY queue, key), '[]'::json)
+		FROM grouped
+	`, qTableName(schema, "river_job")), payload, metadataKeySequenceKey).Scan(&encodedCounts)
+	if err != nil {
+		return nil, err
+	}
+	var grouped []countRow
+	if err := json.Unmarshal(encodedCounts, &grouped); err != nil {
+		return nil, err
+	}
+	for _, item := range grouped {
+		counts[sequenceLookupKey(item.Queue, item.Key)] = item.Count
+	}
+	return counts, nil
+}
+
+func sequenceLookupKey(queue, key string) string {
+	return queue + "\x00" + key
 }
 
 func copyJobToDeadLetter(ctx context.Context, exec riverdriver.Executor, schema string, id int64) error {
