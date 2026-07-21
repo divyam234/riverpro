@@ -2120,24 +2120,41 @@ func (e *Executor) JobDeadLetterMoveDiscarded(ctx context.Context, params *JobDe
 	if e == nil || e.Executor == nil {
 		return nil, errors.New("riverpro driver: nil executor")
 	}
-	if params == nil {
-		params = &JobDeadLetterMoveDiscardedParams{}
+	if params == nil || params.Max <= 0 {
+		return []*rivertype.JobRow{}, nil
 	}
-	all, err := e.JobDeadLetterGetAll(ctx, &JobDeadLetterGetAllParams{Schema: params.Schema})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]*rivertype.JobRow, 0, len(all))
-	for _, j := range all {
-		if !params.DiscardedFinalizedAtHorizon.IsZero() && (j.FinalizedAt == nil || !j.FinalizedAt.Before(params.DiscardedFinalizedAtHorizon)) {
-			continue
-		}
-		r, err := e.JobDeadLetterMoveByID(ctx, &JobDeadLetterMoveByIDParams{ID: j.ID, Schema: params.Schema})
-		if err == nil {
-			out = append(out, r)
-		}
-	}
-	return out, nil
+	schema := params.Schema
+	return scanJSON[[]*rivertype.JobRow](ctx, e.Executor, fmt.Sprintf(`
+		WITH to_move AS MATERIALIZED (
+			SELECT id
+			FROM %s
+			WHERE state = 'discarded'::%s
+			  AND finalized_at < $1
+			ORDER BY finalized_at ASC, id ASC
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		), moved AS (
+			DELETE FROM %s AS j
+			USING to_move
+			WHERE j.id = to_move.id
+			RETURNING j.*
+		), inserted AS (
+			INSERT INTO %s (id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states, dead_lettered_at)
+			SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states, now()
+			FROM moved
+			ON CONFLICT (id) DO NOTHING
+			RETURNING *
+		)
+		SELECT coalesce(json_agg(json_build_object(
+			'ID', id, 'Attempt', attempt, 'AttemptedAt', attempted_at, 'AttemptedBy', attempted_by,
+			'CreatedAt', created_at, 'EncodedArgs', encode(convert_to(args::text, 'UTF8'), 'base64'), 'Errors', errors,
+			'FinalizedAt', finalized_at, 'Kind', kind, 'MaxAttempts', max_attempts,
+			'Metadata', encode(convert_to(metadata::text, 'UTF8'), 'base64'), 'Priority', priority, 'Queue', queue,
+			'ScheduledAt', scheduled_at, 'State', state, 'Tags', tags,
+			'UniqueKey', encode(coalesce(unique_key, ''::bytea), 'base64'), 'UniqueStates', unique_states
+		) ORDER BY finalized_at ASC, id ASC), '[]'::json)
+		FROM inserted
+	`, qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job"), qt(schema, "river_job_dead_letter")), params.DiscardedFinalizedAtHorizon, params.Max)
 }
 func (e *Executor) JobGetAvailableForBatch(ctx context.Context, params *JobGetAvailableForBatchParams) ([]*rivertype.JobRow, error) {
 	if e == nil || e.Executor == nil {

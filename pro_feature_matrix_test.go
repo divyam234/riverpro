@@ -41,6 +41,10 @@ type matrixEphemeralArgs struct{}
 func (matrixEphemeralArgs) Kind() string                 { return "matrix_ephemeral" }
 func (matrixEphemeralArgs) EphemeralOpts() EphemeralOpts { return EphemeralOpts{} }
 
+type matrixResumeArgs struct{}
+
+func (matrixResumeArgs) Kind() string { return "matrix_resume" }
+
 type matrixRetentionArgs struct{ Label string }
 
 func (matrixRetentionArgs) Kind() string { return "matrix_retention" }
@@ -101,6 +105,52 @@ func TestProFeatureMatrix_BatchingFetchesOnlySameBatchKey(t *testing.T) {
 	require.Equal(t, batchKey, metadataStringTest(t, peers[0].Metadata, metadataKeyBatchKey))
 }
 
+func TestProFeatureMatrix_QueueResumeFetchesAvailableJobs(t *testing.T) {
+	ctx := context.Background()
+	started := make(chan struct{}, 1)
+	workers := river.NewWorkers()
+	river.AddWorker(workers, river.WorkFunc(func(context.Context, *river.Job[matrixResumeArgs]) error {
+		started <- struct{}{}
+		return nil
+	}))
+	pool, err := pgxpool.New(ctx, riversharedtest.TestDatabaseURL())
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	drv := riverpropgxv5.New(pool)
+	schema := riverdbtest.TestSchema(ctx, t, drv, nil)
+	client, err := NewClient(drv, &Config{
+		Config: river.Config{
+			Schema:            schema,
+			Workers:           workers,
+			Queues:            map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}},
+			FetchCooldown:     20 * time.Millisecond,
+			FetchPollInterval: 5 * time.Second,
+			TestOnly:          true,
+		},
+		ProQueues: map[string]QueueConfig{
+			river.QueueDefault: {Concurrency: ConcurrencyConfig{GlobalLimit: 1}, MaxWorkers: 1},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.Start(ctx))
+	t.Cleanup(func() { require.NoError(t, client.Stop(context.Background())) })
+	require.NoError(t, client.QueuePause(ctx, river.QueueDefault, nil))
+	inserted, err := client.Insert(ctx, matrixResumeArgs{}, nil)
+	require.NoError(t, err)
+	time.Sleep(100 * time.Millisecond)
+	job, err := drv.GetExecutor().JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: inserted.Job.ID, Schema: schema})
+	require.NoError(t, err)
+	require.Equal(t, rivertype.JobStateAvailable, job.State)
+	require.NoError(t, client.QueueResume(ctx, river.QueueDefault, nil))
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		job, getErr := drv.GetExecutor().JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: inserted.Job.ID, Schema: schema})
+		require.NoError(t, getErr)
+		t.Fatalf("resumed queue did not run available job; state=%s", job.State)
+	}
+}
+
 func TestProFeatureMatrix_EphemeralCompletionDeletesJob(t *testing.T) {
 	ctx := context.Background()
 	workers := river.NewWorkers()
@@ -122,6 +172,7 @@ func TestProFeatureMatrix_EphemeralCompletionDeletesJob(t *testing.T) {
 func TestProFeatureMatrix_DeadLetterAndRetention(t *testing.T) {
 	ctx := context.Background()
 	client, drv, schema := newMatrixClient(t, ctx, &Config{
+		Config:     river.Config{DiscardedJobRetentionPeriod: time.Hour},
 		DeadLetter: DeadLetterConfig{Enabled: true},
 		ProQueues:  map[string]QueueConfig{"short_retention": {CompletedJobRetentionPeriod: time.Millisecond, MaxWorkers: 1}},
 	})
@@ -133,7 +184,18 @@ func TestProFeatureMatrix_DeadLetterAndRetention(t *testing.T) {
 	_, err = pilot.JobSetStateIfRunningMany(ctx, exec, setStateManyForTest(schema, riverdriver.JobSetStateDiscarded(dead.ID, now, []byte(`{"error":"boom"}`), nil)))
 	require.NoError(t, err)
 	_, err = drv.GetProExecutor().JobDeadLetterGetByID(ctx, &prodriver.JobDeadLetterGetByIDParams{ID: dead.ID, Schema: schema})
+	require.ErrorIs(t, err, rivertype.ErrNotFound)
+	stored, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: dead.ID, Schema: schema})
 	require.NoError(t, err)
+	require.Equal(t, rivertype.JobStateDiscarded, stored.State)
+
+	client.deadLetterRetentionPeriod = 0
+	require.NoError(t, client.moveDiscardedToDeadLetterOnce(ctx))
+	_, err = exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: dead.ID, Schema: schema})
+	require.ErrorIs(t, err, rivertype.ErrNotFound)
+	deadLettered, err := drv.GetProExecutor().JobDeadLetterGetByID(ctx, &prodriver.JobDeadLetterGetByIDParams{ID: dead.ID, Schema: schema})
+	require.NoError(t, err)
+	require.Equal(t, rivertype.JobStateDiscarded, deadLettered.State)
 
 	old := time.Now().Add(-time.Hour)
 	keep, err := exec.JobInsertFull(ctx, &riverdriver.JobInsertFullParams{CreatedAt: &old, EncodedArgs: []byte(`{}`), FinalizedAt: &old, Kind: "retention_keep", MaxAttempts: 1, Priority: 1, Metadata: []byte(`{}`), Queue: river.QueueDefault, ScheduledAt: &old, Schema: schema, State: rivertype.JobStateCompleted})

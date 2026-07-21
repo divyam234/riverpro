@@ -140,11 +140,6 @@ func (p *proPilot[TTx]) JobSetStateIfRunningMany(ctx context.Context, exec river
 				postErr = errors.Join(postErr, fmt.Errorf("delete ephemeral job %d: %w", job.ID, deleteErr))
 			}
 		}
-		if p.config != nil && p.config.DeadLetter.Enabled && job.State == rivertype.JobStateDiscarded {
-			if deadErr := copyJobToDeadLetter(ctx, exec, schemaFromParams(params), job.ID); deadErr != nil {
-				postErr = errors.Join(postErr, fmt.Errorf("copy discarded job %d to dead letter: %w", job.ID, deadErr))
-			}
-		}
 	}
 	if len(sequenceKeys) > 0 {
 		keys := make([]string, 0, len(sequenceKeys))
@@ -397,18 +392,6 @@ func sequenceActiveCounts(ctx context.Context, exec riverdriver.Executor, schema
 
 func sequenceLookupKey(queue, key string) string {
 	return queue + "\x00" + key
-}
-
-func copyJobToDeadLetter(ctx context.Context, exec riverdriver.Executor, schema string, id int64) error {
-	if exec == nil {
-		return nil
-	}
-	return exec.Exec(ctx, fmt.Sprintf(`
-		INSERT INTO %s (id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states, dead_lettered_at)
-		SELECT id, args, attempt, attempted_at, attempted_by, created_at, errors, finalized_at, kind, max_attempts, metadata, priority, queue, state, scheduled_at, tags, unique_key, unique_states, now()
-		FROM %s WHERE id = $1
-		ON CONFLICT (id) DO NOTHING
-	`, qTableName(schema, "river_job_dead_letter"), qTableName(schema, "river_job")), id)
 }
 
 func schemaFromParams(params *riverdriver.JobSetStateIfRunningManyParams) string {

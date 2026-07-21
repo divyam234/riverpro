@@ -163,9 +163,10 @@ func (f HookJobDeadLetterMoveFunc) JobDeadLetterMove(ctx context.Context, job *r
 
 type Client[TTx any] struct {
 	*river.Client[TTx]
-	proDriver prodriver.ProDriver[TTx]
-	config    *Config
-	queues    *QueueBundle
+	proDriver                 prodriver.ProDriver[TTx]
+	config                    *Config
+	queues                    *QueueBundle
+	deadLetterRetentionPeriod time.Duration
 }
 
 func NewClient[TTx any](driver prodriver.ProDriver[TTx], config *Config) (*Client[TTx], error) {
@@ -173,6 +174,13 @@ func NewClient[TTx any](driver prodriver.ProDriver[TTx], config *Config) (*Clien
 		return nil, errors.New("riverpro: nil driver")
 	}
 	config = config.WithDefaults()
+	deadLetterRetentionPeriod := config.DiscardedJobRetentionPeriod
+	if deadLetterRetentionPeriod == 0 {
+		deadLetterRetentionPeriod = 7 * 24 * time.Hour
+	}
+	if config.DeadLetter.Enabled {
+		config.DiscardedJobRetentionPeriod = -1
+	}
 	pilot := newProPilot(driver, config)
 	driver.ProConfigInit(pilot)
 	config.Hooks = append(config.Hooks, &workflowRuntimeHook[TTx]{proDriver: driver, schema: config.Schema, interval: config.WorkflowEvaluatorBatchSize})
@@ -180,7 +188,7 @@ func NewClient[TTx any](driver prodriver.ProDriver[TTx], config *Config) (*Clien
 	if err != nil {
 		return nil, err
 	}
-	return &Client[TTx]{Client: c, proDriver: driver, config: config, queues: &QueueBundle{QueueBundle: c.Queues(), proQueues: config.ProQueues}}, nil
+	return &Client[TTx]{Client: c, proDriver: driver, config: config, queues: &QueueBundle{QueueBundle: c.Queues(), proQueues: config.ProQueues}, deadLetterRetentionPeriod: deadLetterRetentionPeriod}, nil
 }
 
 type clientContextKey struct{}
@@ -236,6 +244,7 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	}
 	go c.workflowEvaluatorLoop(ctx)
 	go c.queueRetentionCleanerLoop(ctx)
+	go c.deadLetterCleanerLoop(ctx)
 	go c.workflowRetentionCleanerLoop(ctx)
 	go c.producerRetentionCleanerLoop(ctx)
 	go c.periodicEnqueuerLoop(ctx)
@@ -275,7 +284,7 @@ func (c *Client[TTx]) cleanProQueuesOnce(ctx context.Context) error {
 			params.CompletedDoDelete = true
 			params.CompletedFinalizedAtHorizon = now.Add(-qc.CompletedJobRetentionPeriod)
 		}
-		if qc.DiscardedJobRetentionPeriod > 0 {
+		if !c.config.DeadLetter.Enabled && qc.DiscardedJobRetentionPeriod > 0 {
 			params.DiscardedDoDelete = true
 			params.DiscardedFinalizedAtHorizon = now.Add(-qc.DiscardedJobRetentionPeriod)
 		}
@@ -286,6 +295,34 @@ func (c *Client[TTx]) cleanProQueuesOnce(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (c *Client[TTx]) deadLetterCleanerLoop(ctx context.Context) {
+	if c == nil || c.proDriver == nil || c.config == nil || !c.config.DeadLetter.Enabled || c.deadLetterRetentionPeriod < 0 {
+		return
+	}
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = c.moveDiscardedToDeadLetterOnce(ctx)
+		}
+	}
+}
+
+func (c *Client[TTx]) moveDiscardedToDeadLetterOnce(ctx context.Context) error {
+	if c == nil || c.proDriver == nil || c.config == nil || !c.config.DeadLetter.Enabled || c.deadLetterRetentionPeriod < 0 {
+		return nil
+	}
+	_, err := c.proDriver.GetProExecutor().JobDeadLetterMoveDiscarded(ctx, &prodriver.JobDeadLetterMoveDiscardedParams{
+		DiscardedFinalizedAtHorizon: time.Now().Add(-c.deadLetterRetentionPeriod),
+		Max:                         10_000,
+		Schema:                      c.config.Schema,
+	})
+	return err
 }
 
 func (c *Client[TTx]) workflowRetentionCleanerLoop(ctx context.Context) {
