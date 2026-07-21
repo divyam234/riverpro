@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/riverqueue/river/riverdriver"
@@ -18,13 +19,16 @@ import (
 	"github.com/riverqueue/river/rivertype"
 
 	prodriver "github.com/divyam234/riverpro/driver"
+	"github.com/divyam234/riverpro/riverworkflow"
 )
 
 const (
-	metadataKeyBatchKey     = "riverpro_batch_key"
-	metadataKeyEphemeral    = "riverpro_ephemeral"
-	metadataKeySequenceKey  = "riverpro_sequence_key"
-	producerShutdownTimeout = 5 * time.Second
+	metadataKeyBatchKey                    = "riverpro_batch_key"
+	metadataKeyEphemeral                   = "riverpro_ephemeral"
+	metadataKeySequenceKey                 = "riverpro_sequence_key"
+	metadataKeySequenceContinueOnCancelled = "riverpro_sequence_continue_on_cancelled"
+	metadataKeySequenceContinueOnDiscarded = "riverpro_sequence_continue_on_discarded"
+	producerShutdownTimeout                = 5 * time.Second
 )
 
 type sequenceInsertJob struct {
@@ -68,8 +72,14 @@ func (p *proPilot[TTx]) JobInsertMany(ctx context.Context, exec riverdriver.Exec
 			meta[metadataKeyBatchKey] = batchKey(job.Kind, job.EncodedArgs, batchArgs.BatchOpts().ByArgs, job.Args)
 		}
 		if seqArgs, ok := job.Args.(JobArgsWithSequenceOpts); ok {
-			seqKey := sequenceKey(job.Queue, job.Kind, job.EncodedArgs, seqArgs.SequenceOpts(), job.Args)
+			if workflowID, _ := meta[riverworkflow.MetadataKeyWorkflowID].(string); workflowID != "" {
+				return nil, errors.New("riverpro: sequences are not compatible with workflows")
+			}
+			opts := seqArgs.SequenceOpts()
+			seqKey := sequenceKey(job.Queue, job.Kind, job.EncodedArgs, opts, job.Args)
 			meta[metadataKeySequenceKey] = seqKey
+			meta[metadataKeySequenceContinueOnCancelled] = opts.ContinueOnCancelled
+			meta[metadataKeySequenceContinueOnDiscarded] = opts.ContinueOnDiscarded
 			sequenceJobs = append(sequenceJobs, sequenceInsertJob{job: job, queue: job.Queue, key: seqKey})
 			sequenceKeys = append(sequenceKeys, seqKey)
 		}
@@ -108,13 +118,23 @@ func (p *proPilot[TTx]) JobGetAvailable(ctx context.Context, exec riverdriver.Ex
 	}
 	qc, ok := p.queueConfig(params.Queue)
 	if ok && (qc.Concurrency.GlobalLimit > 0 || qc.Concurrency.LocalLimit > 0) {
-		return (&prodriver.Executor{Executor: exec}).JobGetAvailableLimited(ctx, &prodriver.JobGetAvailableLimitedParams{
+		limitedParams := &prodriver.JobGetAvailableLimitedParams{
 			JobGetAvailableParams: params,
 			GlobalLimit:           int32(qc.Concurrency.GlobalLimit),
 			LocalLimit:            int32(qc.Concurrency.LocalLimit),
 			PartitionByArgs:       qc.Concurrency.Partition.ByArgs,
 			PartitionByKind:       qc.Concurrency.Partition.ByKind,
-		})
+		}
+		if producerState, ok := state.(*proProducerState); ok {
+			limitedParams.CurrentProducerPartitionKeys, limitedParams.CurrentProducerPartitionRunningCounts = producerState.snapshot()
+		}
+		jobs, err := (&prodriver.Executor{Executor: exec}).JobGetAvailableLimited(ctx, limitedParams)
+		if err == nil {
+			if producerState, ok := state.(*proProducerState); ok {
+				producerState.add(jobs)
+			}
+		}
+		return jobs, err
 	}
 	return p.StandardPilot.JobGetAvailable(ctx, exec, state, params)
 }
@@ -132,7 +152,7 @@ func (p *proPilot[TTx]) JobSetStateIfRunningMany(ctx context.Context, exec river
 			continue
 		}
 		meta := metadataMap(job.Metadata)
-		if key, _ := meta[metadataKeySequenceKey].(string); key != "" && isFinalState(job.State) {
+		if key, _ := meta[metadataKeySequenceKey].(string); key != "" && sequenceShouldContinue(job.State, meta) {
 			sequenceKeys[key] = true
 		}
 		if isTruthy(meta[metadataKeyEphemeral]) && job.State == rivertype.JobStateCompleted {
@@ -184,7 +204,8 @@ func (p *proPilot[TTx]) ProducerInit(ctx context.Context, exec riverdriver.Execu
 	if err != nil {
 		return 0, nil, err
 	}
-	return producer.ID, &proProducerState{}, nil
+	qc, _ := p.queueConfig(params.Queue)
+	return producer.ID, &proProducerState{queue: params.Queue, partition: qc.Concurrency.Partition, running: map[string]int32{}}, nil
 }
 
 func (p *proPilot[TTx]) ProducerKeepAlive(ctx context.Context, exec riverdriver.Executor, params *riverdriver.ProducerKeepAliveParams) error {
@@ -207,9 +228,96 @@ func producerShutdownContext(ctx context.Context) (context.Context, context.Canc
 	return context.WithTimeout(context.WithoutCancel(ctx), producerShutdownTimeout)
 }
 
-type proProducerState struct{}
+type proProducerState struct {
+	mu        sync.Mutex
+	queue     string
+	partition PartitionConfig
+	running   map[string]int32
+}
 
-func (s *proProducerState) JobFinish(job *rivertype.JobRow) {}
+func (s *proProducerState) JobFinish(job *rivertype.JobRow) {
+	if s == nil || job == nil {
+		return
+	}
+	key := concurrencyPartitionKey(job, s.partition)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running[key] <= 1 {
+		delete(s.running, key)
+		return
+	}
+	s.running[key]--
+}
+
+func (s *proProducerState) add(jobs []*rivertype.JobRow) {
+	if s == nil || len(jobs) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, job := range jobs {
+		if job != nil {
+			s.running[concurrencyPartitionKey(job, s.partition)]++
+		}
+	}
+}
+
+func (s *proProducerState) snapshot() ([]string, []int32) {
+	if s == nil {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := make([]string, 0, len(s.running))
+	for key := range s.running {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	counts := make([]int32, len(keys))
+	for i, key := range keys {
+		counts[i] = s.running[key]
+	}
+	return keys, counts
+}
+
+func concurrencyPartitionKey(job *rivertype.JobRow, partition PartitionConfig) string {
+	parts := make([]string, 0, 2)
+	if partition.ByKind {
+		parts = append(parts, "kind="+job.Kind)
+	}
+	if partition.ByArgs != nil {
+		args := string(job.EncodedArgs)
+		if len(partition.ByArgs) > 0 {
+			var raw map[string]json.RawMessage
+			if json.Unmarshal(job.EncodedArgs, &raw) == nil {
+				keys := append([]string(nil), partition.ByArgs...)
+				sort.Strings(keys)
+				var b strings.Builder
+				b.WriteByte('{')
+				for i, key := range keys {
+					if i > 0 {
+						b.WriteString(", ")
+					}
+					name, _ := json.Marshal(key)
+					b.Write(name)
+					b.WriteString(": ")
+					if value, ok := raw[key]; ok {
+						b.Write(value)
+					} else {
+						b.WriteString("null")
+					}
+				}
+				b.WriteByte('}')
+				args = b.String()
+			}
+		}
+		parts = append(parts, "args="+args)
+	}
+	if len(parts) == 0 {
+		return "queue=" + job.Queue
+	}
+	return strings.Join(parts, "|")
+}
 
 func (p *proPilot[TTx]) queueConfig(queue string) (QueueConfig, bool) {
 	if queue == "" {
@@ -401,10 +509,14 @@ func schemaFromParams(params *riverdriver.JobSetStateIfRunningManyParams) string
 	return params.Schema
 }
 
-func isFinalState(state rivertype.JobState) bool {
+func sequenceShouldContinue(state rivertype.JobState, metadata map[string]any) bool {
 	switch state {
-	case rivertype.JobStateCancelled, rivertype.JobStateCompleted, rivertype.JobStateDiscarded:
+	case rivertype.JobStateCompleted:
 		return true
+	case rivertype.JobStateCancelled:
+		return isTruthy(metadata[metadataKeySequenceContinueOnCancelled])
+	case rivertype.JobStateDiscarded:
+		return isTruthy(metadata[metadataKeySequenceContinueOnDiscarded])
 	default:
 		return false
 	}

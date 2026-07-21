@@ -9,6 +9,8 @@ import (
 
 	"github.com/divyam234/riverpro/riverworkflow"
 	"github.com/riverqueue/river"
+	"github.com/riverqueue/river/rivertype"
+	"github.com/stretchr/testify/require"
 )
 
 type testArgs struct{ KindValue string }
@@ -317,4 +319,105 @@ func TestBuildPeriodicJobUpdateParamsPatchesOnlySelectedFields(t *testing.T) {
 	if _, err := buildPeriodicJobUpdateParams("periodic-update", &PeriodicJobUpdateOpts{}, nil); err == nil {
 		t.Fatal("empty periodic update should fail validation")
 	}
+}
+
+func TestNormalizeProQueues(t *testing.T) {
+	t.Parallel()
+
+	config := &Config{Config: river.Config{Workers: river.NewWorkers()}, ProQueues: map[string]QueueConfig{
+		"limited": {
+			MaxWorkers:        7,
+			FetchCooldown:     time.Second,
+			FetchPollInterval: 2 * time.Second,
+			Concurrency:       ConcurrencyConfig{GlobalLimit: 3, LocalLimit: 2},
+		},
+	}}
+	clone := cloneConfig(config)
+	require.NoError(t, normalizeProQueues(clone))
+	require.Nil(t, config.Queues, "normalization must not mutate the caller's config")
+	require.Equal(t, river.QueueConfig{MaxWorkers: 7, FetchCooldown: time.Second, FetchPollInterval: 2 * time.Second}, clone.Queues["limited"])
+}
+
+func TestNormalizeProQueuesValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		config *Config
+		match  string
+	}{
+		{name: "empty queue", config: &Config{ProQueues: map[string]QueueConfig{"": {}}}, match: "empty queue name"},
+		{name: "negative global", config: &Config{ProQueues: map[string]QueueConfig{"q": {Concurrency: ConcurrencyConfig{GlobalLimit: -1}}}}, match: "GlobalLimit"},
+		{name: "negative local", config: &Config{ProQueues: map[string]QueueConfig{"q": {Concurrency: ConcurrencyConfig{LocalLimit: -1}}}}, match: "LocalLimit"},
+		{name: "empty arg", config: &Config{ProQueues: map[string]QueueConfig{"q": {Concurrency: ConcurrencyConfig{Partition: PartitionConfig{ByArgs: []string{""}}}}}}, match: "must not be empty"},
+		{name: "duplicate arg", config: &Config{ProQueues: map[string]QueueConfig{"q": {Concurrency: ConcurrencyConfig{Partition: PartitionConfig{ByArgs: []string{"tenant", "tenant"}}}}}}, match: "duplicated"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.ErrorContains(t, normalizeProQueues(tt.config), tt.match)
+		})
+	}
+}
+
+func TestProProducerStatePartitionCounts(t *testing.T) {
+	t.Parallel()
+
+	state := &proProducerState{partition: PartitionConfig{ByKind: true, ByArgs: []string{"tenant"}}, running: map[string]int32{}}
+	jobs := []*rivertype.JobRow{
+		{ID: 1, Queue: "default", Kind: "email", EncodedArgs: []byte(`{"other": 1, "tenant": "a"}`)},
+		{ID: 2, Queue: "default", Kind: "email", EncodedArgs: []byte(`{"tenant": "a"}`)},
+		{ID: 3, Queue: "default", Kind: "email", EncodedArgs: []byte(`{"tenant": "b"}`)},
+	}
+	state.add(jobs)
+	keys, counts := state.snapshot()
+	require.Equal(t, []string{`kind=email|args={"tenant": "a"}`, `kind=email|args={"tenant": "b"}`}, keys)
+	require.Equal(t, []int32{2, 1}, counts)
+
+	state.JobFinish(jobs[0])
+	keys, counts = state.snapshot()
+	require.Equal(t, []string{`kind=email|args={"tenant": "a"}`, `kind=email|args={"tenant": "b"}`}, keys)
+	require.Equal(t, []int32{1, 1}, counts)
+}
+
+func TestSequenceShouldContinue(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, sequenceShouldContinue(rivertype.JobStateCompleted, nil))
+	require.False(t, sequenceShouldContinue(rivertype.JobStateCancelled, nil))
+	require.False(t, sequenceShouldContinue(rivertype.JobStateDiscarded, nil))
+	require.True(t, sequenceShouldContinue(rivertype.JobStateCancelled, map[string]any{metadataKeySequenceContinueOnCancelled: true}))
+	require.True(t, sequenceShouldContinue(rivertype.JobStateDiscarded, map[string]any{metadataKeySequenceContinueOnDiscarded: true}))
+	require.False(t, sequenceShouldContinue(rivertype.JobStateRetryable, map[string]any{metadataKeySequenceContinueOnCancelled: true, metadataKeySequenceContinueOnDiscarded: true}))
+}
+
+func TestSequenceKeyOptions(t *testing.T) {
+	t.Parallel()
+
+	type taggedArgs struct {
+		CustomerID string `json:"customer_id" river:"sequence"`
+		TraceID    string `json:"trace_id"`
+	}
+	args := taggedArgs{CustomerID: "customer-1", TraceID: "trace-1"}
+	encoded := []byte(`{"customer_id":"customer-1","trace_id":"trace-1"}`)
+
+	defaultKey := sequenceKey("queue-a", "kind-a", encoded, SequenceOpts{}, args)
+	require.Equal(t, stableKey("kind=kind-a"), defaultKey)
+
+	byArgsKey := sequenceKey("queue-a", "kind-a", encoded, SequenceOpts{ByArgs: true}, args)
+	require.Equal(t, stableKey("kind=kind-a", `args={"customer_id":"customer-1"}`), byArgsKey)
+
+	crossKindKey := sequenceKey("queue-a", "kind-a", encoded, SequenceOpts{ByArgs: true, ExcludeKind: true}, args)
+	require.Equal(t, stableKey(`args={"customer_id":"customer-1"}`), crossKindKey)
+
+	byQueueKey := sequenceKey("queue-a", "kind-a", encoded, SequenceOpts{ByQueue: true}, args)
+	require.Equal(t, stableKey("queue=queue-a", "kind=kind-a"), byQueueKey)
+}
+
+func TestRandomWorkflowIDIsCanonicalULID(t *testing.T) {
+	t.Parallel()
+
+	id := randomWorkflowID()
+	require.Len(t, id, 26)
+	require.Regexp(t, `^[0-7][0-9A-HJKMNP-TV-Z]{25}$`, id)
 }

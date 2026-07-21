@@ -4,16 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/divyam234/riverpro"
 	prodriver "github.com/divyam234/riverpro/driver"
 	"github.com/riverqueue/river"
-	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivertype"
 )
 
@@ -27,63 +26,89 @@ type JobArgsWithBatchOpts interface {
 	river.JobArgs
 	BatchOpts() riverpro.BatchOpts
 }
+
 type ManyWorker[T JobArgsWithBatchOpts] interface {
 	WorkMany(context.Context, []*river.Job[T]) error
 }
+
 type WorkerOpts struct {
 	MaxCount     int
 	MaxDelay     time.Duration
 	PollInterval time.Duration
 }
 
-type worker[T JobArgsWithBatchOpts] struct {
+type worker[T JobArgsWithBatchOpts, TTx any] struct {
 	river.WorkerDefaults[T]
 	many ManyWorker[T]
-	f    func(context.Context, []*river.Job[T]) error
 	opts WorkerOpts
 }
 
+type funcManyWorker[T JobArgsWithBatchOpts] func(context.Context, []*river.Job[T]) error
+
+func (f funcManyWorker[T]) WorkMany(ctx context.Context, jobs []*river.Job[T]) error {
+	return f(ctx, jobs)
+}
+
+// Work gathers matching jobs until MaxCount is reached or MaxDelay elapses,
+// then invokes mw once for the full batch.
 func Work[T JobArgsWithBatchOpts, TTx any](ctx context.Context, mw ManyWorker[T], job *river.Job[T], opts *WorkerOpts) error {
-	if mw == nil {
-		return errors.New("riverbatch: nil worker")
-	}
 	if job == nil {
 		return errors.New("riverbatch: nil job")
+	}
+	if mw == nil {
+		return errors.New("riverbatch: nil worker")
 	}
 	o, err := normalizeOpts(opts)
 	if err != nil {
 		return err
 	}
+
 	jobs := []*river.Job[T]{job}
-	if client, err := riverpro.ClientFromContextSafely[TTx](ctx); err == nil && client != nil && client.ProExecutor() != nil && o.MaxCount > 1 {
-		batchKey := metadataString(job.Metadata, "riverpro_batch_key")
-		if batchKey != "" {
+	client, clientErr := riverpro.ClientFromContextSafely[TTx](ctx)
+	batchKey := metadataString(job.Metadata, "riverpro_batch_key")
+	if clientErr == nil && client != nil && client.ProExecutor() != nil && batchKey != "" && o.MaxCount > 1 {
+		deadline := time.Now().Add(o.MaxDelay)
+		for len(jobs) < o.MaxCount {
 			rows, fetchErr := client.ProExecutor().JobGetAvailableForBatch(ctx, &prodriver.JobGetAvailableForBatchParams{
 				AttemptedBy:      attemptedBy(job),
 				BatchKey:         batchKey,
 				BatchLeaderJobID: job.ID,
 				Kind:             job.Kind,
-				Max:              int32(o.MaxCount - 1),
+				Max:              int32(o.MaxCount - len(jobs)),
 				Queue:            job.Queue,
 				Schema:           client.Schema(),
 			})
 			if fetchErr != nil {
-				return fetchErr
+				return batchResult(jobs, fetchErr)
 			}
 			for _, row := range rows {
 				var args T
 				if err := json.Unmarshal(row.EncodedArgs, &args); err != nil {
-					return err
+					return batchResult(jobs, err)
 				}
 				jobs = append(jobs, &river.Job[T]{JobRow: row, Args: args})
 			}
+			if len(jobs) >= o.MaxCount || !time.Now().Before(deadline) {
+				break
+			}
+
+			wait := o.PollInterval
+			if remaining := time.Until(deadline); wait > remaining {
+				wait = remaining
+			}
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return batchResult(jobs, context.Cause(ctx))
+			case <-timer.C:
+			}
 		}
 	}
-	err = mw.WorkMany(ctx, jobs)
-	if len(jobs) > 1 {
-		err = errors.Join(err, completeFetchedPeers(ctx, jobs[1:], err))
-	}
-	return err
+
+	return batchResult(jobs, mw.WorkMany(ctx, jobs))
 }
 
 func Worker[T JobArgsWithBatchOpts, TTx any](mw ManyWorker[T], opts *WorkerOpts) river.Worker[T] {
@@ -94,8 +119,9 @@ func Worker[T JobArgsWithBatchOpts, TTx any](mw ManyWorker[T], opts *WorkerOpts)
 	if err != nil {
 		panic(err)
 	}
-	return &worker[T]{many: mw, opts: o}
+	return &worker[T, TTx]{many: mw, opts: o}
 }
+
 func WorkFunc[T JobArgsWithBatchOpts, TTx any](f func(context.Context, []*river.Job[T]) error, opts *WorkerOpts) river.Worker[T] {
 	w, err := WorkFuncSafely[T, TTx](f, opts)
 	if err != nil {
@@ -103,6 +129,7 @@ func WorkFunc[T JobArgsWithBatchOpts, TTx any](f func(context.Context, []*river.
 	}
 	return w
 }
+
 func WorkFuncSafely[T JobArgsWithBatchOpts, TTx any](f func(context.Context, []*river.Job[T]) error, opts *WorkerOpts) (river.Worker[T], error) {
 	if f == nil {
 		return nil, errors.New("riverbatch: nil work func")
@@ -111,8 +138,9 @@ func WorkFuncSafely[T JobArgsWithBatchOpts, TTx any](f func(context.Context, []*
 	if err != nil {
 		return nil, err
 	}
-	return &worker[T]{f: f, opts: o}, nil
+	return &worker[T, TTx]{many: funcManyWorker[T](f), opts: o}, nil
 }
+
 func normalizeOpts(opts *WorkerOpts) (WorkerOpts, error) {
 	o := WorkerOpts{MaxCount: MaxCountDefault, MaxDelay: MaxDelayDefault, PollInterval: PollIntervalDefault}
 	if opts != nil {
@@ -137,15 +165,9 @@ func normalizeOpts(opts *WorkerOpts) (WorkerOpts, error) {
 	}
 	return o, nil
 }
-func (w *worker[T]) Work(ctx context.Context, job *river.Job[T]) error {
-	if job == nil {
-		return errors.New("riverbatch: nil job")
-	}
-	jobs := []*river.Job[T]{job}
-	if w.many != nil {
-		return w.many.WorkMany(ctx, jobs)
-	}
-	return w.f(ctx, jobs)
+
+func (w *worker[T, TTx]) Work(ctx context.Context, job *river.Job[T]) error {
+	return Work[T, TTx](ctx, w.many, job, &w.opts)
 }
 
 func metadataString(data []byte, key string) string {
@@ -167,43 +189,36 @@ func attemptedBy[T JobArgsWithBatchOpts](job *river.Job[T]) string {
 	return job.AttemptedBy[len(job.AttemptedBy)-1]
 }
 
-func completeFetchedPeers[T JobArgsWithBatchOpts](ctx context.Context, jobs []*river.Job[T], workErr error) error {
-	if len(jobs) == 0 || workErr != nil {
-		return nil
-	}
-	client, err := riverpro.ClientFromContextSafely[any](ctx)
-	if err != nil || client == nil || client.ProExecutor() == nil {
-		return nil
-	}
-	ids := make([]int64, 0, len(jobs))
-	for _, job := range jobs {
-		if job != nil {
-			ids = append(ids, job.ID)
+func batchResult[T JobArgsWithBatchOpts](jobs []*river.Job[T], workErr error) error {
+	if len(jobs) == 1 {
+		if multi, ok := workErr.(*MultiError); !ok {
+			return workErr
+		} else {
+			setJobs(multi, jobs)
+			return multi
 		}
 	}
-	if len(ids) == 0 {
-		return nil
+
+	if multi, ok := workErr.(*MultiError); ok {
+		setJobs(multi, jobs)
+		return multi
 	}
-	now := time.Now()
-	states := make([]rivertype.JobState, len(ids))
-	finalized := make([]*time.Time, len(ids))
-	for i := range ids {
-		states[i] = rivertype.JobStateCompleted
-		finalized[i] = &now
+	multi := NewMultiError()
+	if workErr != nil {
+		multi.generic = append(multi.generic, workErr)
 	}
-	_, err = client.ProExecutor().JobSetStateIfRunningMany(ctx, &riverdriver.JobSetStateIfRunningManyParams{ID: ids, FinalizedAt: finalized, State: states, Schema: client.Schema()})
-	if err != nil {
-		return fmt.Errorf("riverbatch: complete fetched peers: %w", err)
-	}
-	return nil
+	setJobs(multi, jobs)
+	return multi
 }
 
 type MultiError struct {
 	generic []error
 	byID    map[int64]error
+	jobs    []*rivertype.JobRow
 }
 
 func NewMultiError() *MultiError { return &MultiError{byID: map[int64]error{}} }
+
 func (e *MultiError) Add(job *rivertype.JobRow, err error) {
 	if err == nil {
 		return
@@ -214,6 +229,7 @@ func (e *MultiError) Add(job *rivertype.JobRow, err error) {
 	}
 	e.AddByID(job.ID, err)
 }
+
 func (e *MultiError) AddByID(jobID int64, err error) {
 	if err == nil {
 		return
@@ -223,18 +239,21 @@ func (e *MultiError) AddByID(jobID int64, err error) {
 	}
 	e.byID[jobID] = err
 }
+
 func (e *MultiError) Get(job *rivertype.JobRow) error {
 	if job == nil {
 		return nil
 	}
 	return e.GetByID(job.ID)
 }
+
 func (e *MultiError) GetByID(jobID int64) error {
 	if e == nil {
 		return nil
 	}
 	return e.byID[jobID]
 }
+
 func (e *MultiError) Error() string {
 	if e == nil {
 		return ""
@@ -249,11 +268,16 @@ func (e *MultiError) Error() string {
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	for _, id := range ids {
-		parts = append(parts, fmt.Sprintf("job %d: %v", id, e.byID[id]))
+		parts = append(parts, "job "+strconv.FormatInt(id, 10)+": "+e.byID[id].Error())
+	}
+	if len(parts) == 0 && len(e.jobs) > 0 {
+		return "riverbatch: batch completed"
 	}
 	return strings.Join(parts, "; ")
 }
+
 func (e *MultiError) Is(target error) bool { _, ok := target.(*MultiError); return ok }
+
 func (e *MultiError) Unwrap() []error {
 	if e == nil {
 		return nil
@@ -269,9 +293,44 @@ func (e *MultiError) Unwrap() []error {
 	}
 	return out
 }
+
 func (e *MultiError) Err() error {
 	if e == nil || len(e.generic)+len(e.byID) == 0 {
 		return nil
 	}
 	return e
+}
+
+func (e *MultiError) ErrorsByID() map[int64]error {
+	if e == nil {
+		return nil
+	}
+	out := make(map[int64]error, len(e.jobs))
+	for _, job := range e.jobs {
+		if job == nil {
+			continue
+		}
+		errList := append([]error(nil), e.generic...)
+		if err := e.byID[job.ID]; err != nil {
+			errList = append(errList, err)
+		}
+		out[job.ID] = errors.Join(errList...)
+	}
+	return out
+}
+
+func (e *MultiError) Jobs() []*rivertype.JobRow {
+	if e == nil {
+		return nil
+	}
+	return e.jobs
+}
+
+func setJobs[T JobArgsWithBatchOpts](e *MultiError, jobs []*river.Job[T]) {
+	e.jobs = make([]*rivertype.JobRow, 0, len(jobs))
+	for _, job := range jobs {
+		if job != nil && job.JobRow != nil {
+			e.jobs = append(e.jobs, job.JobRow)
+		}
+	}
 }

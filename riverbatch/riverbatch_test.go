@@ -118,3 +118,58 @@ func TestMultiError(t *testing.T) {
 	require.Nil(t, nilMulti.Err())
 	require.Nil(t, nilMulti.Unwrap())
 }
+
+func TestBatchResultCompletesAllJobsOnSuccess(t *testing.T) {
+	t.Parallel()
+
+	jobs := []*river.Job[batchTestArgs]{
+		{JobRow: &rivertype.JobRow{ID: 1}},
+		{JobRow: &rivertype.JobRow{ID: 2}},
+	}
+	err := batchResult(jobs, nil)
+	require.Error(t, err)
+
+	result, ok := err.(interface {
+		ErrorsByID() map[int64]error
+		Jobs() []*rivertype.JobRow
+	})
+	require.True(t, ok)
+	require.Equal(t, []*rivertype.JobRow{jobs[0].JobRow, jobs[1].JobRow}, result.Jobs())
+	require.Contains(t, result.ErrorsByID(), int64(1))
+	require.Contains(t, result.ErrorsByID(), int64(2))
+	require.NoError(t, result.ErrorsByID()[1])
+	require.NoError(t, result.ErrorsByID()[2])
+}
+
+func TestBatchResultAppliesRegularErrorToEveryJob(t *testing.T) {
+	t.Parallel()
+
+	workErr := errors.New("batch failed")
+	jobs := []*river.Job[batchTestArgs]{
+		{JobRow: &rivertype.JobRow{ID: 1}},
+		{JobRow: &rivertype.JobRow{ID: 2}},
+	}
+	result := batchResult(jobs, workErr).(interface {
+		ErrorsByID() map[int64]error
+	})
+	require.ErrorIs(t, result.ErrorsByID()[1], workErr)
+	require.ErrorIs(t, result.ErrorsByID()[2], workErr)
+}
+
+func TestBatchResultPreservesPerJobErrors(t *testing.T) {
+	t.Parallel()
+
+	jobErr := errors.New("job failed")
+	jobs := []*river.Job[batchTestArgs]{
+		{JobRow: &rivertype.JobRow{ID: 1}},
+		{JobRow: &rivertype.JobRow{ID: 2}},
+	}
+	multi := NewMultiError()
+	multi.AddByID(2, jobErr)
+
+	result := batchResult(jobs, multi).(interface {
+		ErrorsByID() map[int64]error
+	})
+	require.NoError(t, result.ErrorsByID()[1])
+	require.ErrorIs(t, result.ErrorsByID()[2], jobErr)
+}

@@ -173,7 +173,10 @@ func NewClient[TTx any](driver prodriver.ProDriver[TTx], config *Config) (*Clien
 	if driver == nil {
 		return nil, errors.New("riverpro: nil driver")
 	}
-	config = config.WithDefaults()
+	config = cloneConfig(config.WithDefaults())
+	if err := normalizeProQueues(config); err != nil {
+		return nil, err
+	}
 	deadLetterRetentionPeriod := config.DiscardedJobRetentionPeriod
 	if deadLetterRetentionPeriod == 0 {
 		deadLetterRetentionPeriod = 7 * 24 * time.Hour
@@ -189,6 +192,58 @@ func NewClient[TTx any](driver prodriver.ProDriver[TTx], config *Config) (*Clien
 		return nil, err
 	}
 	return &Client[TTx]{Client: c, proDriver: driver, config: config, queues: &QueueBundle{QueueBundle: c.Queues(), proQueues: config.ProQueues}, deadLetterRetentionPeriod: deadLetterRetentionPeriod}, nil
+}
+
+func cloneConfig(config *Config) *Config {
+	if config == nil {
+		return &Config{}
+	}
+	clone := *config
+	if config.Queues != nil {
+		clone.Queues = make(map[string]river.QueueConfig, len(config.Queues))
+		for name, queue := range config.Queues {
+			clone.Queues[name] = queue
+		}
+	}
+	return &clone
+}
+
+func normalizeProQueues(config *Config) error {
+	if config == nil || len(config.ProQueues) == 0 {
+		return nil
+	}
+	for name, proQueue := range config.ProQueues {
+		if name == "" {
+			return errors.New("riverpro: ProQueues contains an empty queue name")
+		}
+		if proQueue.Concurrency.GlobalLimit < 0 {
+			return fmt.Errorf("riverpro: queue %q GlobalLimit must be non-negative", name)
+		}
+		if proQueue.Concurrency.LocalLimit < 0 {
+			return fmt.Errorf("riverpro: queue %q LocalLimit must be non-negative", name)
+		}
+		seenArgs := make(map[string]struct{}, len(proQueue.Concurrency.Partition.ByArgs))
+		for _, arg := range proQueue.Concurrency.Partition.ByArgs {
+			if arg == "" {
+				return fmt.Errorf("riverpro: queue %q partition argument name must not be empty", name)
+			}
+			if _, exists := seenArgs[arg]; exists {
+				return fmt.Errorf("riverpro: queue %q partition argument %q is duplicated", name, arg)
+			}
+			seenArgs[arg] = struct{}{}
+		}
+		if config.Workers != nil {
+			if config.Queues == nil {
+				config.Queues = map[string]river.QueueConfig{}
+			}
+			queue := config.Queues[name]
+			queue.FetchCooldown = proQueue.FetchCooldown
+			queue.FetchPollInterval = proQueue.FetchPollInterval
+			queue.MaxWorkers = proQueue.MaxWorkers
+			config.Queues[name] = queue
+		}
+	}
+	return nil
 }
 
 type clientContextKey struct{}
@@ -984,8 +1039,20 @@ func (c *Client[TTx]) WorkflowFromExistingID(ctx context.Context, workflowID str
 	if workflowID == "" {
 		return nil, errors.New("riverpro: workflow ID is empty")
 	}
+	if c == nil || c.proDriver == nil {
+		return nil, errors.New("riverpro: client is not configured with a Pro driver")
+	}
+	row, err := c.proDriver.GetProExecutor().WorkflowGetByID(ctx, &prodriver.WorkflowGetByIDParams{Schema: c.config.Schema, WorkflowID: workflowID})
+	if err != nil {
+		return nil, err
+	}
 	opts = cloneWorkflowOpts(opts)
-	opts.ID = workflowID
+	opts.ID = row.ID
+	if row.Name != nil {
+		opts.Name = *row.Name
+	} else {
+		opts.Name = ""
+	}
 	return c.NewWorkflow(opts), nil
 }
 func (c *Client[TTx]) NewWorkflow(opts *WorkflowOpts) *WorkflowT[TTx] { return newWorkflowT(c, opts) }
@@ -1204,12 +1271,39 @@ func cloneWorkflowOpts(opts *WorkflowOpts) *WorkflowOpts {
 	return &c
 }
 func randomWorkflowID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err == nil {
-		return hex.EncodeToString(b[:])
+	var entropy [10]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		copy(entropy[:], []byte(deterministicWorkflowID(time.Now().String())))
 	}
-	return deterministicWorkflowID(time.Now().String())
+	var data [16]byte
+	millis := uint64(time.Now().UnixMilli())
+	data[0] = byte(millis >> 40)
+	data[1] = byte(millis >> 32)
+	data[2] = byte(millis >> 24)
+	data[3] = byte(millis >> 16)
+	data[4] = byte(millis >> 8)
+	data[5] = byte(millis)
+	copy(data[6:], entropy[:])
+	return encodeULID(data)
 }
+
+func encodeULID(data [16]byte) string {
+	const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	var out [26]byte
+	for i := range out {
+		var value byte
+		for j := 0; j < 5; j++ {
+			bit := i*5 + j - 2
+			value <<= 1
+			if bit >= 0 && bit < 128 {
+				value |= (data[bit/8] >> (7 - uint(bit%8))) & 1
+			}
+		}
+		out[i] = alphabet[value]
+	}
+	return string(out[:])
+}
+
 func deterministicWorkflowID(parts ...string) string {
 	h := sha256.New()
 	for _, p := range parts {

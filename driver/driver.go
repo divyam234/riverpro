@@ -3328,7 +3328,7 @@ func (e *Executor) SequencePromote(ctx context.Context, params *SequencePromoteP
 				LEFT JOIN LATERAL (
 					SELECT j.id FROM %s AS j
 					WHERE j.state = 'pending'::%s AND j.metadata->>'riverpro_sequence_key' = p.key
-					ORDER BY j.priority, j.scheduled_at, j.id
+					ORDER BY j.id
 					LIMIT 1 FOR UPDATE SKIP LOCKED
 				) AS candidate ON true
 			), promoted AS (
