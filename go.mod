@@ -4,12 +4,12 @@ go 1.25.0
 
 require (
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/riverqueue/river v0.39.0
-	github.com/riverqueue/river/riverdriver v0.39.0
+	github.com/riverqueue/river v0.41.1
+	github.com/riverqueue/river/riverdriver v0.41.1
 	github.com/riverqueue/river/riverdriver/riverdatabasesql v0.39.0
-	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.39.0
-	github.com/riverqueue/river/rivershared v0.39.0
-	github.com/riverqueue/river/rivertype v0.39.0
+	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.41.1
+	github.com/riverqueue/river/rivershared v0.41.1
+	github.com/riverqueue/river/rivertype v0.41.1
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/stretchr/testify v1.11.1
 	github.com/tidwall/gjson v1.19.0
@@ -27,8 +27,8 @@ require (
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
 	go.uber.org/goleak v1.3.0 // indirect
-	golang.org/x/sync v0.21.0 // indirect
+	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
