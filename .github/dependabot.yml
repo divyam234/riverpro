@@ -8,3 +8,12 @@ updates:
     labels:
       - "dependencies"
     open-pull-requests-limit: 10
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 10
