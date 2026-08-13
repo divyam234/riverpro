@@ -52,7 +52,7 @@ func MigrationLineProTruncateTables(line string, version int) []string {
 	if line != MigrationLinePro {
 		panic(fmt.Sprintf("unknown pro migration line %q", line))
 	}
-	return []string{"river_job_dead_letter", "river_job_sequence", "river_periodic_job", "river_producer", "river_workflow", "river_workflow_attempt", "river_workflow_attempt_task", "river_workflow_signal", "river_workflow_timer", "river_workflow_worklist"}
+	return []string{"river_job_dead_letter", "river_job_sequence_inbox", "river_job_sequence", "river_periodic_job", "river_producer", "river_workflow", "river_workflow_attempt", "river_workflow_attempt_task", "river_workflow_signal", "river_workflow_timer", "river_workflow_worklist"}
 }
 
 type ProDriver[TTx any] interface {
@@ -75,6 +75,8 @@ type ProExecutor interface {
 	JobGetAvailableForBatch(ctx context.Context, params *JobGetAvailableForBatchParams) ([]*rivertype.JobRow, error)
 	JobGetAvailableLimited(ctx context.Context, params *JobGetAvailableLimitedParams) ([]*rivertype.JobRow, error)
 	JobGetAvailablePartitionKeys(ctx context.Context, params *JobGetAvailablePartitionKeysParams) ([]string, error)
+	JobGetStuckWithInactiveProducer(ctx context.Context, params *JobGetStuckWithInactiveProducerParams) ([]*rivertype.JobRow, error)
+	JobRescueManyWithInactiveProducer(ctx context.Context, params *JobRescueManyWithInactiveProducerParams) error
 	PGTryAdvisoryXactLock(ctx context.Context, key int64) (bool, error)
 	PeriodicJobGetAll(ctx context.Context, params *PeriodicJobGetAllParams) ([]*PeriodicJob, error)
 	PeriodicJobGetByID(ctx context.Context, params *PeriodicJobGetByIDParams) (*PeriodicJob, error)
@@ -256,6 +258,20 @@ type JobGetAvailableLimitedParams struct {
 type JobGetAvailablePartitionKeysParams struct {
 	Queue  string
 	Schema string
+}
+
+// JobGetStuckWithInactiveProducerParams extends River's age-based stuck-job
+// query with jobs whose latest producer heartbeat is stale or missing.
+type JobGetStuckWithInactiveProducerParams struct {
+	*riverdriver.JobGetStuckParams
+	ProducerStaleHorizon time.Time
+}
+
+// JobRescueManyWithInactiveProducerParams guards a rescue update with the same
+// age-or-inactive-producer condition used to select the jobs.
+type JobRescueManyWithInactiveProducerParams struct {
+	*riverdriver.JobRescueManyParams
+	ProducerStaleHorizon time.Time
 }
 
 // PeriodicJob
@@ -1965,6 +1981,82 @@ FROM updated_jobs AS j
 	return jobs, nil
 }
 
+func (e *Executor) JobGetStuckWithInactiveProducer(ctx context.Context, params *JobGetStuckWithInactiveProducerParams) ([]*rivertype.JobRow, error) {
+	if e == nil || e.Executor == nil {
+		return nil, errors.New("riverpro driver: nil executor")
+	}
+	if params == nil || params.JobGetStuckParams == nil || params.Max <= 0 {
+		return []*rivertype.JobRow{}, nil
+	}
+	schema := params.Schema
+	return scanJSON[[]*rivertype.JobRow](ctx, e.Executor, fmt.Sprintf(`
+		SELECT coalesce(json_agg(%[1]s ORDER BY j.id), '[]'::json)
+		FROM (
+			SELECT j.*
+			FROM %[2]s AS j
+			LEFT JOIN %[3]s AS p
+			  ON p.client_id = j.attempted_by[array_length(j.attempted_by, 1)]
+			 AND p.queue_name = j.queue
+			WHERE j.state = 'running'::%[4]s
+			  AND j.id > $1
+			  AND (
+				j.attempted_at < $2
+				OR (
+					coalesce(array_length(j.attempted_by, 1), 0) > 0
+					AND (p.id IS NULL OR p.updated_at < $3)
+				)
+			  )
+			ORDER BY j.id
+			LIMIT $4
+		) AS j
+	`, jobRowJSONObjectSQL("j"), qt(schema, "river_job"), qt(schema, "river_producer"), qt(schema, "river_job_state")), params.AfterID, params.StuckHorizon, params.ProducerStaleHorizon, params.Max)
+}
+
+func (e *Executor) JobRescueManyWithInactiveProducer(ctx context.Context, params *JobRescueManyWithInactiveProducerParams) error {
+	if e == nil || e.Executor == nil {
+		return errors.New("riverpro driver: nil executor")
+	}
+	if params == nil || params.JobRescueManyParams == nil || len(params.ID) == 0 {
+		return nil
+	}
+	if len(params.Error) != len(params.ID) || len(params.FinalizedAt) != len(params.ID) || len(params.ScheduledAt) != len(params.ID) || len(params.State) != len(params.ID) {
+		return errors.New("riverpro driver: rescue parameter lengths must match job IDs")
+	}
+	schema := params.Schema
+	return e.Executor.Exec(ctx, fmt.Sprintf(`
+		UPDATE %[1]s AS j
+		SET errors = array_append(j.errors, updated.error),
+		    finalized_at = updated.finalized_at,
+		    scheduled_at = updated.scheduled_at,
+		    metadata = j.metadata || jsonb_build_object(
+		        'river:rescue_count',
+		        coalesce(CASE WHEN jsonb_typeof(j.metadata->'river:rescue_count') = 'number' THEN (j.metadata->>'river:rescue_count')::int END, 0) + 1
+		    ),
+		    state = updated.state::%[2]s
+		FROM (
+			SELECT unnest($1::bigint[]) AS id,
+			       unnest($2::jsonb[]) AS error,
+			       unnest($3::timestamptz[]) AS finalized_at,
+			       unnest($4::timestamptz[]) AS scheduled_at,
+			       unnest($5::text[]) AS state
+		) AS updated
+		WHERE j.id = updated.id
+		  AND j.state = 'running'::%[2]s
+		  AND (
+			j.attempted_at < $6
+			OR (
+				coalesce(array_length(j.attempted_by, 1), 0) > 0
+				AND NOT EXISTS (
+					SELECT 1 FROM %[3]s AS p
+					WHERE p.client_id = j.attempted_by[array_length(j.attempted_by, 1)]
+					  AND p.queue_name = j.queue
+					  AND p.updated_at >= $7
+				)
+			)
+		  )
+	`, qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_producer")), params.ID, params.Error, params.FinalizedAt, params.ScheduledAt, params.State, params.StuckHorizon, params.ProducerStaleHorizon)
+}
+
 func jobConcurrencyPartitionKeySQL(alias string, byKind bool, byArgs []string) string {
 	parts := make([]string, 0, 2)
 	if byKind {
@@ -3258,9 +3350,12 @@ func (e *Executor) SequenceAppendMany(ctx context.Context, params *SequenceAppen
 				SELECT key FROM keys
 				ON CONFLICT (key) DO NOTHING
 				RETURNING id
+			), inbox AS (
+				INSERT INTO %s (key)
+				SELECT key FROM unnest($1::text[]) AS key WHERE key <> ''
 			)
 			SELECT to_json(count(*)::int) FROM inserted
-		`, qt(schema, "river_job_sequence")), params.SeqKeys)
+		`, qt(schema, "river_job_sequence"), qt(schema, "river_job_sequence_inbox")), params.SeqKeys)
 	}
 	compat.Lock()
 	defer compat.Unlock()
@@ -3321,10 +3416,21 @@ func (e *Executor) SequencePromote(ctx context.Context, params *SequencePromoteP
 			WITH requested AS MATERIALIZED (
 				SELECT DISTINCT key FROM unnest($1::text[]) AS key
 			), present AS MATERIALIZED (
-				SELECT r.key FROM requested AS r JOIN %s AS s USING (key)
+				SELECT r.key, min(inbox.id) AS inbox_id
+				FROM requested AS r
+				JOIN %s AS s USING (key)
+				JOIN %s AS inbox USING (key)
+				WHERE NOT EXISTS (
+					SELECT 1 FROM %s AS active
+					WHERE active.metadata->>'riverpro_sequence_key' = r.key
+					  AND active.state IN ('available', 'retryable', 'running', 'scheduled')
+				)
+				GROUP BY r.key
+			), consumed AS (
+				DELETE FROM %s AS inbox USING present AS p WHERE inbox.id = p.inbox_id RETURNING inbox.key
 			), next_jobs AS MATERIALIZED (
 				SELECT p.key, candidate.id
-				FROM present AS p
+				FROM consumed AS p
 				LEFT JOIN LATERAL (
 					SELECT j.id FROM %s AS j
 					WHERE j.state = 'pending'::%s AND j.metadata->>'riverpro_sequence_key' = p.key
@@ -3338,11 +3444,11 @@ func (e *Executor) SequencePromote(ctx context.Context, params *SequencePromoteP
 				RETURNING j.id
 			)
 			SELECT json_build_object(
-				'PromotedKeys', coalesce((SELECT json_agg(key ORDER BY key) FROM present), '[]'::json),
+				'PromotedKeys', coalesce((SELECT json_agg(key ORDER BY key) FROM consumed), '[]'::json),
 				'SkippedKeys', coalesce((SELECT json_agg(r.key ORDER BY r.key) FROM requested AS r LEFT JOIN present AS p USING (key) WHERE p.key IS NULL), '[]'::json)
 			)
 			FROM (SELECT count(*) FROM promoted) AS promoted_count
-		`, qt(schema, "river_job_sequence"), qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job_state")), params.Keys, now)
+		`, qt(schema, "river_job_sequence"), qt(schema, "river_job_sequence_inbox"), qt(schema, "river_job"), qt(schema, "river_job_sequence_inbox"), qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job_state")), params.Keys, now)
 	}
 	res.PromotedKeys = append(res.PromotedKeys, params.Keys...)
 	return res, nil
@@ -3353,6 +3459,50 @@ func (e *Executor) SequencePromoteFromTable(ctx context.Context, params *Sequenc
 		return res, nil
 	}
 	max := limitDefault(params.Max, 100)
+	if dbAvailable(e) {
+		now := nowUTC()
+		if params.Now != nil {
+			now = *params.Now
+		}
+		schema := params.Schema
+		return scanJSON[*SequencePromoteFromTableResult](ctx, e.Executor, fmt.Sprintf(`
+			WITH eligible_keys AS MATERIALIZED (
+				SELECT DISTINCT inbox.key
+				FROM %s AS inbox
+				WHERE NOT EXISTS (
+					SELECT 1 FROM %s AS active
+					WHERE active.metadata->>'riverpro_sequence_key' = inbox.key
+					  AND active.state IN ('available', 'retryable', 'running', 'scheduled')
+				)
+			), ranked AS MATERIALIZED (
+				SELECT id, key, row_number() OVER (PARTITION BY key ORDER BY id) AS key_row
+				FROM %s WHERE key IN (SELECT key FROM eligible_keys)
+			), selected AS MATERIALIZED (
+				SELECT id, key FROM ranked ORDER BY key_row, key, id LIMIT $1
+			), consumed AS MATERIALIZED (
+				DELETE FROM %s AS inbox USING selected WHERE inbox.id = selected.id RETURNING inbox.key
+			), keys AS MATERIALIZED (
+				SELECT DISTINCT key FROM consumed
+			), next_jobs AS MATERIALIZED (
+				SELECT keys.key, candidate.id
+				FROM keys
+				LEFT JOIN LATERAL (
+					SELECT j.id FROM %s AS j
+					WHERE j.state = 'pending'::%s AND j.metadata->>'riverpro_sequence_key' = keys.key
+					ORDER BY j.id LIMIT 1 FOR UPDATE SKIP LOCKED
+				) AS candidate ON true
+			), promoted AS (
+				UPDATE %s AS j
+				SET state = CASE WHEN j.scheduled_at <= $2 THEN 'available'::%s ELSE 'scheduled'::%s END
+				FROM next_jobs WHERE j.id = next_jobs.id RETURNING j.id
+			)
+			SELECT json_build_object(
+				'NumDeleted', (SELECT count(*) FROM consumed),
+				'NumPromoted', (SELECT count(*) FROM promoted),
+				'Continue', EXISTS (SELECT 1 FROM %s)
+			)
+		`, qt(schema, "river_job_sequence_inbox"), qt(schema, "river_job"), qt(schema, "river_job_sequence_inbox"), qt(schema, "river_job_sequence_inbox"), qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_job_state"), qt(schema, "river_job_sequence_inbox")), max, now)
+	}
 	seqs, err := e.SequenceList(ctx, &SequenceListParams{Schema: params.Schema, MaxCount: max})
 	if err != nil {
 		return nil, err
@@ -3366,7 +3516,7 @@ func (e *Executor) SequencePromoteFromTable(ctx context.Context, params *Sequenc
 		return nil, err
 	}
 	res.NumPromoted = len(promoted.PromotedKeys)
-	res.NumDeleted = len(promoted.SkippedKeys)
+	res.NumDeleted = len(promoted.PromotedKeys)
 	res.Continue = len(seqs) == max
 	return res, nil
 }
@@ -3849,7 +3999,40 @@ func (e *Executor) WorkflowGetFinalizationCandidates(ctx context.Context, params
 	return out, nil
 }
 func (e *Executor) WorkflowGetLegacyBackfillIDs(ctx context.Context, params *WorkflowGetLegacyBackfillIDsParams) ([]string, error) {
-	return e.WorkflowGetFinalizationCandidates(ctx, &WorkflowGetFinalizationCandidatesParams{AfterWorkflowID: params.AfterWorkflowID, LimitCount: params.LimitCount, Schema: params.Schema})
+	if params == nil {
+		return []string{}, nil
+	}
+	if dbAvailable(e) {
+		legacyIndexesPresent, err := scanJSON[bool](ctx, e.Executor, `
+			SELECT to_json(EXISTS (
+				SELECT 1
+				FROM pg_indexes
+				WHERE schemaname = coalesce(nullif($1, ''), current_schema())
+				  AND tablename = 'river_job'
+				  AND indexdef LIKE '%metadata%workflow_id%'
+			))
+		`, params.Schema)
+		if err != nil {
+			return nil, err
+		}
+		if !legacyIndexesPresent {
+			return []string{}, nil
+		}
+		return scanJSON[[]string](ctx, e.Executor, fmt.Sprintf(`
+			SELECT coalesce(json_agg(id ORDER BY id), '[]'::json)
+			FROM (
+				SELECT DISTINCT j.metadata->>'workflow_id' AS id
+				FROM %s AS j
+				LEFT JOIN %s AS w ON w.id = j.metadata->>'workflow_id'
+				WHERE j.metadata ? 'workflow_id'
+				  AND j.metadata->>'workflow_id' > $1
+				  AND w.id IS NULL
+				ORDER BY id
+				LIMIT $2
+			) AS legacy
+		`, qt(params.Schema, "river_job"), qt(params.Schema, "river_workflow")), params.AfterWorkflowID, limitDefault(int(params.LimitCount), 100))
+	}
+	return []string{}, nil
 }
 func (e *Executor) WorkflowHasWaitTasksMany(ctx context.Context, params *WorkflowHasWaitTasksManyParams) ([]string, error) {
 	if params == nil {

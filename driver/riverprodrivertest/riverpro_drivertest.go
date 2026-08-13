@@ -78,6 +78,7 @@ func Exercise[TTx any](ctx context.Context, t *testing.T,
 	exerciseWorkflowWorklists(ctx, t, executorWithTx)
 	exerciseConcurrencyLimits(ctx, t, executorWithTx)
 	exerciseConcurrencyLocalLimitRace(ctx, t, driverWithSchema)
+	exerciseActiveJobRescue(ctx, t, executorWithTx)
 	exerciseDocumentedExecutorAPI(ctx, t, executorWithTx)
 }
 
@@ -542,6 +543,60 @@ func exerciseSequences[TTx any](ctx context.Context, t *testing.T,
 		require.NoError(t, err)
 		require.Equal(t, []string{"seq-a"}, promoted.PromotedKeys)
 		require.Equal(t, []string{"missing"}, promoted.SkippedKeys)
+	})
+	t.Run("SequencePromotionBoundsRedundantCleanup", func(t *testing.T) {
+		t.Parallel()
+		exec, schema := execSchema(ctx, t, executorWithTx)
+		_, err := exec.SequenceAppendMany(ctx, &driver.SequenceAppendManyParams{Schema: schema, SeqKeys: []string{"bounded-seq"}})
+		require.NoError(t, err)
+		insertJob(ctx, t, exec, schema, "bounded-kind", rivertype.JobStatePending, []byte(`{"riverpro_sequence_key":"bounded-seq"}`), []byte(`{}`), nil)
+		require.NoError(t, exec.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (key) SELECT 'bounded-seq' FROM generate_series(1, 4)`, qname(schema, "river_job_sequence_inbox"))))
+		now := time.Now().UTC().Add(time.Second)
+
+		result, err := exec.SequencePromoteFromTable(ctx, &driver.SequencePromoteFromTableParams{Max: 2, Now: &now, Schema: schema})
+		require.NoError(t, err)
+		require.Equal(t, 1, result.NumPromoted)
+		require.Equal(t, 2, result.NumDeleted)
+		require.True(t, result.Continue)
+
+		jobs, err := exec.JobList(ctx, &riverdriver.JobListParams{Max: 10, NamedArgs: map[string]any{"key": "bounded-seq"}, OrderByClause: "id", Schema: schema, WhereClause: "metadata->>'riverpro_sequence_key' = @key"})
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		require.Equal(t, rivertype.JobStateAvailable, jobs[0].State)
+		requireRowCount(ctx, t, exec, schema, "river_job_sequence", 1)
+		requireRowCount(ctx, t, exec, schema, "river_job_sequence_inbox", 3)
+	})
+}
+
+func exerciseActiveJobRescue[TTx any](ctx context.Context, t *testing.T,
+	executorWithTx func(ctx context.Context, t *testing.T) (driver.ProExecutor, driver.ProDriver[TTx]),
+) {
+	t.Helper()
+	t.Run("ActiveJobRescueFindsMissingAndStaleProducers", func(t *testing.T) {
+		t.Parallel()
+		exec, schema := execSchema(ctx, t, executorWithTx)
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		freshAttempt := now.Add(-time.Minute)
+		staleProducerTime := now.Add(-time.Hour)
+
+		stale, err := exec.ProducerInsertOrUpdate(ctx, &driver.ProducerInsertOrUpdateParams{ClientID: "stale-owner", CreatedAt: &staleProducerTime, MaxWorkers: 1, QueueName: "default", Schema: schema, UpdatedAt: &staleProducerTime})
+		require.NoError(t, err)
+		live, err := exec.ProducerInsertOrUpdate(ctx, &driver.ProducerInsertOrUpdateParams{ClientID: "live-owner", MaxWorkers: 1, QueueName: "default", Schema: schema})
+		require.NoError(t, err)
+
+		missingJob := insertJob(ctx, t, exec, schema, "missing-owner-kind", rivertype.JobStateRunning, []byte(`{}`), []byte(`{}`), nil)
+		staleJob := insertJob(ctx, t, exec, schema, "stale-owner-kind", rivertype.JobStateRunning, []byte(`{}`), []byte(`{}`), nil)
+		liveJob := insertJob(ctx, t, exec, schema, "live-owner-kind", rivertype.JobStateRunning, []byte(`{}`), []byte(`{}`), nil)
+		require.NoError(t, exec.Exec(ctx, fmt.Sprintf(`UPDATE %s SET attempted_at = $1, attempted_by = ARRAY[$2] WHERE id = $3`, qname(schema, "river_job")), freshAttempt, "missing-owner", missingJob.ID))
+		require.NoError(t, exec.Exec(ctx, fmt.Sprintf(`UPDATE %s SET attempted_at = $1, attempted_by = ARRAY[$2] WHERE id = $3`, qname(schema, "river_job")), freshAttempt, stale.ClientID, staleJob.ID))
+		require.NoError(t, exec.Exec(ctx, fmt.Sprintf(`UPDATE %s SET attempted_at = $1, attempted_by = ARRAY[$2] WHERE id = $3`, qname(schema, "river_job")), freshAttempt, live.ClientID, liveJob.ID))
+
+		jobs, err := exec.JobGetStuckWithInactiveProducer(ctx, &driver.JobGetStuckWithInactiveProducerParams{
+			JobGetStuckParams:    &riverdriver.JobGetStuckParams{Max: 10, Schema: schema, StuckHorizon: now.Add(-24 * time.Hour)},
+			ProducerStaleHorizon: now.Add(-30 * time.Minute),
+		})
+		require.NoError(t, err)
+		require.ElementsMatch(t, []int64{missingJob.ID, staleJob.ID}, jobIDs(jobs))
 	})
 }
 

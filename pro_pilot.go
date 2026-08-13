@@ -139,6 +139,35 @@ func (p *proPilot[TTx]) JobGetAvailable(ctx context.Context, exec riverdriver.Ex
 	return p.StandardPilot.JobGetAvailable(ctx, exec, state, params)
 }
 
+func (p *proPilot[TTx]) JobGetStuck(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobGetStuckParams) ([]*rivertype.JobRow, error) {
+	if params == nil {
+		return nil, nil
+	}
+	staleAfter := 30 * time.Minute
+	if p != nil && p.config != nil && p.config.ProducerStaleRetentionPeriod > 0 {
+		staleAfter = p.config.ProducerStaleRetentionPeriod
+	}
+	return (&prodriver.Executor{Executor: exec}).JobGetStuckWithInactiveProducer(ctx, &prodriver.JobGetStuckWithInactiveProducerParams{
+		JobGetStuckParams:    params,
+		ProducerStaleHorizon: time.Now().Add(-staleAfter),
+	})
+}
+
+func (p *proPilot[TTx]) JobRescueMany(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobRescueManyParams) (*struct{}, error) {
+	if params == nil {
+		return &struct{}{}, nil
+	}
+	staleAfter := 30 * time.Minute
+	if p != nil && p.config != nil && p.config.ProducerStaleRetentionPeriod > 0 {
+		staleAfter = p.config.ProducerStaleRetentionPeriod
+	}
+	err := (&prodriver.Executor{Executor: exec}).JobRescueManyWithInactiveProducer(ctx, &prodriver.JobRescueManyWithInactiveProducerParams{
+		JobRescueManyParams:  params,
+		ProducerStaleHorizon: time.Now().Add(-staleAfter),
+	})
+	return &struct{}{}, err
+}
+
 func (p *proPilot[TTx]) JobSetStateIfRunningMany(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {
 	updated, err := p.StandardPilot.JobSetStateIfRunningMany(ctx, exec, params)
 	if err != nil || len(updated) == 0 {

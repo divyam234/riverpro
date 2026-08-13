@@ -23,11 +23,12 @@ func TestTestTxPgxPro(t *testing.T) {
 			'river_periodic_job',
 			'river_producer',
 			'river_job_sequence',
+			'river_job_sequence_inbox',
 			'river_workflow',
 			'river_workflow_signal'
 		  )
 	`).Scan(&tableCount))
-	require.Equal(t, 6, tableCount)
+	require.Equal(t, 7, tableCount)
 }
 
 func TestWaitExpectTimeout(t *testing.T) {

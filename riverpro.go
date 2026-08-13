@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"sort"
 	"strings"
@@ -303,7 +304,52 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	go c.workflowRetentionCleanerLoop(ctx)
 	go c.producerRetentionCleanerLoop(ctx)
 	go c.periodicEnqueuerLoop(ctx)
+	go c.sequenceSupervisorLoop(ctx)
 	return nil
+}
+
+func (c *Client[TTx]) sequenceSupervisorLoop(ctx context.Context) {
+	if c == nil || c.proDriver == nil || c.config == nil {
+		return
+	}
+	interval := c.config.SequenceSchedulerInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	batchSize := 10_000
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			startedAt := time.Now()
+			_, err := c.proDriver.GetProExecutor().SequencePromoteFromTable(ctx, &prodriver.SequencePromoteFromTableParams{Max: batchSize, Schema: c.config.Schema})
+			if err != nil {
+				failures++
+				c.sequenceSupervisorLogger().ErrorContext(ctx, "riverpro: sequence promotion failed", slog.Int("failure_count", failures), slog.Duration("duration", time.Since(startedAt)), slog.Int("batch_size", batchSize), slog.String("error", err.Error()))
+				if failures >= 2 && batchSize != 1_000 {
+					batchSize = 1_000
+					c.sequenceSupervisorLogger().WarnContext(ctx, "riverpro: reducing sequence promotion batch size", slog.Int("batch_size", batchSize))
+				}
+				continue
+			}
+			if failures > 0 {
+				c.sequenceSupervisorLogger().InfoContext(ctx, "riverpro: sequence promotion recovered", slog.Int("failure_count", failures), slog.Int("batch_size", batchSize))
+			}
+			failures = 0
+			batchSize = 10_000
+		}
+	}
+}
+
+func (c *Client[TTx]) sequenceSupervisorLogger() *slog.Logger {
+	if c != nil && c.config != nil && c.config.Logger != nil {
+		return c.config.Logger
+	}
+	return slog.Default()
 }
 
 func (c *Client[TTx]) queueRetentionCleanerLoop(ctx context.Context) {
