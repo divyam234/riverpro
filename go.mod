@@ -4,11 +4,11 @@ go 1.26.0
 
 require (
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/riverqueue/river v0.44.0
+	github.com/riverqueue/river v0.45.0
 	github.com/riverqueue/river/riverdriver v0.45.0
 	github.com/riverqueue/river/riverdriver/riverdatabasesql v0.44.0
-	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.44.0
-	github.com/riverqueue/river/rivershared v0.44.0
+	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.45.0
+	github.com/riverqueue/river/rivershared v0.45.0
 	github.com/riverqueue/river/rivertype v0.45.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/stretchr/testify v1.12.1
