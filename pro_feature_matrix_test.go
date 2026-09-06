@@ -316,6 +316,13 @@ func TestProFeatureMatrix_GracefulShutdownDeletesProducer(t *testing.T) {
 		return rows[0].Producer != nil && rows[0].Producer.ClientID == clientID
 	})
 
+	producers, err := client.ProducerList(ctx, &ProducerListOpts{Queue: river.QueueDefault})
+	require.NoError(t, err)
+	require.Len(t, producers, 1)
+	require.Equal(t, clientID, producers[0].ClientID)
+	require.Equal(t, river.QueueDefault, producers[0].Queue)
+	require.Equal(t, 10, producers[0].MaxWorkers)
+
 	rows, err := drv.GetProExecutor().ProducerListByQueue(ctx, &prodriver.ProducerListByQueueParams{QueueName: river.QueueDefault, Schema: schema})
 	require.NoError(t, err)
 	require.Len(t, rows, 1, "producer row should exist while client is running")

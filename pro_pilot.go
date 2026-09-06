@@ -229,7 +229,15 @@ func (p *proPilot[TTx]) PeriodicJobUpsertMany(ctx context.Context, exec riverdri
 }
 
 func (p *proPilot[TTx]) ProducerInit(ctx context.Context, exec riverdriver.Executor, params *riverpilot.ProducerInitParams) (int64, riverpilot.ProducerState, error) {
-	producer, err := (&prodriver.Executor{Executor: exec}).ProducerInsertOrUpdate(ctx, &prodriver.ProducerInsertOrUpdateParams{ID: params.ProducerID, ClientID: params.ClientID, QueueName: params.Queue, Schema: params.Schema})
+	maxWorkers := int32(0)
+	if p != nil && p.config != nil {
+		if queueConfig, ok := p.config.Queues[params.Queue]; ok {
+			maxWorkers = int32(queueConfig.MaxWorkers)
+		}
+	}
+	producer, err := (&prodriver.Executor{Executor: exec}).ProducerInsertOrUpdate(ctx, &prodriver.ProducerInsertOrUpdateParams{
+		ID: params.ProducerID, ClientID: params.ClientID, QueueName: params.Queue, MaxWorkers: maxWorkers, Schema: params.Schema,
+	})
 	if err != nil {
 		return 0, nil, err
 	}
