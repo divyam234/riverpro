@@ -1113,12 +1113,34 @@ func exerciseDocumentedExecutorAPI[TTx any](ctx context.Context, t *testing.T,
 		discardedA := insertJob(ctx, t, exec, schema, "retry-many-a", rivertype.JobStateDiscarded, []byte(`{}`), []byte(`{}`), &discardedAt)
 		discardedB := insertJob(ctx, t, exec, schema, "retry-many-b", rivertype.JobStateDiscarded, []byte(`{}`), []byte(`{}`), &discardedAt)
 		completed := insertJob(ctx, t, exec, schema, "retry-many-completed", rivertype.JobStateCompleted, []byte(`{}`), []byte(`{}`), &discardedAt)
+
+		// River's default unique-state mask includes available but excludes discarded,
+		// so discarded rows can share a key but only one may become available again.
+		const defaultUniqueStates = byte(0b11110101)
+		insertUnique := func(kind string, state rivertype.JobState, key []byte, finalizedAt *time.Time) *rivertype.JobRow {
+			job, err := exec.JobInsertFull(ctx, &riverdriver.JobInsertFullParams{
+				CreatedAt: &now, EncodedArgs: []byte(`{}`), FinalizedAt: finalizedAt, Kind: kind,
+				MaxAttempts: 3, Metadata: []byte(`{}`), Priority: 1, Queue: "default",
+				ScheduledAt: &now, Schema: schema, State: state, UniqueKey: key, UniqueStates: defaultUniqueStates,
+			})
+			require.NoError(t, err)
+			return job
+		}
+		duplicateKey := []byte("retry-many-duplicate-key")
+		duplicateOld := insertUnique("retry-many-unique-old", rivertype.JobStateDiscarded, duplicateKey, &discardedAt)
+		duplicateNew := insertUnique("retry-many-unique-new", rivertype.JobStateDiscarded, duplicateKey, &discardedAt)
+		activeKey := []byte("retry-many-active-key")
+		blockedDiscarded := insertUnique("retry-many-blocked", rivertype.JobStateDiscarded, activeKey, &discardedAt)
+		activeJob := insertUnique("retry-many-active", rivertype.JobStateAvailable, activeKey, nil)
+
 		bulkRetried, err := exec.JobRetryMany(ctx, &driver.JobRetryManyParams{Now: &now, Schema: schema, States: []rivertype.JobState{rivertype.JobStateDiscarded}})
 		require.NoError(t, err)
-		require.Equal(t, 2, bulkRetried)
-		rows, err := exec.JobGetByIDMany(ctx, &riverdriver.JobGetByIDManyParams{ID: []int64{discardedA.ID, discardedB.ID, completed.ID}, Schema: schema})
+		require.Equal(t, 3, bulkRetried)
+		rows, err := exec.JobGetByIDMany(ctx, &riverdriver.JobGetByIDManyParams{ID: []int64{
+			discardedA.ID, discardedB.ID, completed.ID, duplicateOld.ID, duplicateNew.ID, blockedDiscarded.ID, activeJob.ID,
+		}, Schema: schema})
 		require.NoError(t, err)
-		require.Len(t, rows, 3)
+		require.Len(t, rows, 7)
 		statesByID := map[int64]rivertype.JobState{}
 		for _, row := range rows {
 			statesByID[row.ID] = row.State
@@ -1126,6 +1148,10 @@ func exerciseDocumentedExecutorAPI[TTx any](ctx context.Context, t *testing.T,
 		require.Equal(t, rivertype.JobStateAvailable, statesByID[discardedA.ID])
 		require.Equal(t, rivertype.JobStateAvailable, statesByID[discardedB.ID])
 		require.Equal(t, rivertype.JobStateCompleted, statesByID[completed.ID])
+		require.Equal(t, rivertype.JobStateDiscarded, statesByID[duplicateOld.ID])
+		require.Equal(t, rivertype.JobStateAvailable, statesByID[duplicateNew.ID])
+		require.Equal(t, rivertype.JobStateDiscarded, statesByID[blockedDiscarded.ID])
+		require.Equal(t, rivertype.JobStateAvailable, statesByID[activeJob.ID])
 
 		oldDone := now.Add(-2 * time.Hour)
 		_ = insertJob(ctx, t, exec, schema, "delete-before", rivertype.JobStateCompleted, []byte(`{}`), []byte(`{}`), &oldDone)

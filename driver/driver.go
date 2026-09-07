@@ -1861,22 +1861,58 @@ func (e *Executor) JobRetryMany(ctx context.Context, params *JobRetryManyParams)
 		states = append(states, string(state))
 	}
 	return scanJSON[int](ctx, e.Executor, fmt.Sprintf(`
-		WITH updated AS (
-			UPDATE %s
-			SET state = 'available'::%s,
-				max_attempts = CASE WHEN attempt = max_attempts THEN max_attempts + 1 ELSE max_attempts END,
-				finalized_at = NULL,
-				scheduled_at = coalesce($1::timestamptz, now())
+		WITH candidates AS MATERIALIZED (
+			SELECT id
+			FROM %s
 			WHERE state::text = ANY($2::text[])
 			  AND state != 'running'::%s
 			  AND NOT (
 				state = 'available'::%s
 				AND scheduled_at < coalesce($1::timestamptz, now())
 			  )
+		), retryable AS MATERIALIZED (
+			SELECT candidate.id
+			FROM candidates candidate
+			JOIN %s job ON job.id = candidate.id
+			WHERE job.unique_key IS NULL
+			   OR job.unique_states IS NULL
+			   OR NOT %s(job.unique_states, 'available'::%s)
+			   OR (
+				candidate.id = (
+					SELECT max(other_candidate.id)
+					FROM candidates other_candidate
+					JOIN %s other_job ON other_job.id = other_candidate.id
+					WHERE other_job.unique_key = job.unique_key
+					  AND other_job.unique_states IS NOT NULL
+					  AND %s(other_job.unique_states, 'available'::%s)
+				)
+				AND NOT EXISTS (
+					SELECT 1
+					FROM %s existing
+					WHERE existing.id != job.id
+					  AND existing.unique_key = job.unique_key
+					  AND existing.unique_states IS NOT NULL
+					  AND %s(existing.unique_states, existing.state)
+				)
+			   )
+		), updated AS (
+			UPDATE %s job
+			SET state = 'available'::%s,
+				max_attempts = CASE WHEN attempt = max_attempts THEN max_attempts + 1 ELSE max_attempts END,
+				finalized_at = NULL,
+				scheduled_at = coalesce($1::timestamptz, now())
+			FROM retryable
+			WHERE job.id = retryable.id
 			RETURNING 1
 		)
 		SELECT to_json(count(*)) FROM updated
-	`, qt(params.Schema, "river_job"), qt(params.Schema, "river_job_state"), qt(params.Schema, "river_job_state"), qt(params.Schema, "river_job_state")), params.Now, states)
+	`,
+		qt(params.Schema, "river_job"), qt(params.Schema, "river_job_state"), qt(params.Schema, "river_job_state"),
+		qt(params.Schema, "river_job"), qt(params.Schema, "river_job_state_in_bitmask"), qt(params.Schema, "river_job_state"),
+		qt(params.Schema, "river_job"), qt(params.Schema, "river_job_state_in_bitmask"), qt(params.Schema, "river_job_state"),
+		qt(params.Schema, "river_job"), qt(params.Schema, "river_job_state_in_bitmask"),
+		qt(params.Schema, "river_job"), qt(params.Schema, "river_job_state"),
+	), params.Now, states)
 }
 func (e *Executor) JobGetAvailableLimited(ctx context.Context, params *JobGetAvailableLimitedParams) ([]*rivertype.JobRow, error) {
 	if e == nil || e.Executor == nil {
