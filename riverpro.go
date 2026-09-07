@@ -170,6 +170,11 @@ type Client[TTx any] struct {
 	deadLetterRetentionPeriod time.Duration
 }
 
+// JobRetryManyParams selects jobs to retry in one database operation.
+type JobRetryManyParams struct {
+	States []rivertype.JobState
+}
+
 func NewClient[TTx any](driver prodriver.ProDriver[TTx], config *Config) (*Client[TTx], error) {
 	if driver == nil {
 		return nil, errors.New("riverpro: nil driver")
@@ -193,6 +198,28 @@ func NewClient[TTx any](driver prodriver.ProDriver[TTx], config *Config) (*Clien
 		return nil, err
 	}
 	return &Client[TTx]{Client: c, proDriver: driver, config: config, queues: &QueueBundle{QueueBundle: c.Queues(), proQueues: config.ProQueues}, deadLetterRetentionPeriod: deadLetterRetentionPeriod}, nil
+}
+
+// JobRetryMany makes all matching jobs immediately available for retry in one database operation.
+func (c *Client[TTx]) JobRetryMany(ctx context.Context, params *JobRetryManyParams) (int, error) {
+	if params == nil || len(params.States) == 0 {
+		return 0, nil
+	}
+	return c.proDriver.GetProExecutor().JobRetryMany(ctx, &prodriver.JobRetryManyParams{
+		Schema: c.config.Schema,
+		States: params.States,
+	})
+}
+
+// JobRetryManyTx is the transactional variant of JobRetryMany.
+func (c *Client[TTx]) JobRetryManyTx(ctx context.Context, tx TTx, params *JobRetryManyParams) (int, error) {
+	if params == nil || len(params.States) == 0 {
+		return 0, nil
+	}
+	return c.proDriver.UnwrapProExecutor(tx).JobRetryMany(ctx, &prodriver.JobRetryManyParams{
+		Schema: c.config.Schema,
+		States: params.States,
+	})
 }
 
 func cloneConfig(config *Config) *Config {

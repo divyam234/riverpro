@@ -72,6 +72,7 @@ type ProExecutor interface {
 	JobDeadLetterMoveDiscarded(ctx context.Context, params *JobDeadLetterMoveDiscardedParams) ([]*rivertype.JobRow, error)
 	JobDeleteByIDMany(ctx context.Context, params *JobDeleteByIDManyParams) ([]*rivertype.JobRow, error)
 	JobDeleteNonWorkflowBefore(ctx context.Context, params *JobDeleteNonWorkflowBeforeParams) (int, error)
+	JobRetryMany(ctx context.Context, params *JobRetryManyParams) (int, error)
 	JobGetAvailableForBatch(ctx context.Context, params *JobGetAvailableForBatchParams) ([]*rivertype.JobRow, error)
 	JobGetAvailableLimited(ctx context.Context, params *JobGetAvailableLimitedParams) ([]*rivertype.JobRow, error)
 	JobGetAvailablePartitionKeys(ctx context.Context, params *JobGetAvailablePartitionKeysParams) ([]string, error)
@@ -213,6 +214,13 @@ type JobDeadLetterMoveDiscardedParams struct {
 type JobDeleteByIDManyParams struct {
 	ID     []int64
 	Schema string
+}
+
+// JobRetryManyParams
+type JobRetryManyParams struct {
+	Now    *time.Time
+	Schema string
+	States []rivertype.JobState
 }
 
 // JobDeleteNonWorkflowBeforeParams
@@ -1839,6 +1847,36 @@ func (e *Executor) JobDeleteNonWorkflowBefore(ctx context.Context, params *JobDe
 		return 0, nil
 	}
 	return e.Executor.JobDeleteBefore(ctx, &riverdriver.JobDeleteBeforeParams{CancelledDoDelete: params.CancelledDoDelete, CancelledFinalizedAtHorizon: params.CancelledFinalizedAtHorizon, CompletedDoDelete: params.CompletedDoDelete, CompletedFinalizedAtHorizon: params.CompletedFinalizedAtHorizon, DiscardedDoDelete: params.DiscardedDoDelete, DiscardedFinalizedAtHorizon: params.DiscardedFinalizedAtHorizon, Max: params.Max, QueuesExcluded: params.QueuesExcluded, QueuesIncluded: params.QueuesIncluded, Schema: params.Schema})
+}
+
+func (e *Executor) JobRetryMany(ctx context.Context, params *JobRetryManyParams) (int, error) {
+	if e == nil || e.Executor == nil {
+		return 0, errors.New("riverpro driver: nil executor")
+	}
+	if params == nil || len(params.States) == 0 {
+		return 0, nil
+	}
+	states := make([]string, 0, len(params.States))
+	for _, state := range params.States {
+		states = append(states, string(state))
+	}
+	return scanJSON[int](ctx, e.Executor, fmt.Sprintf(`
+		WITH updated AS (
+			UPDATE %s
+			SET state = 'available'::%s,
+				max_attempts = CASE WHEN attempt = max_attempts THEN max_attempts + 1 ELSE max_attempts END,
+				finalized_at = NULL,
+				scheduled_at = coalesce($1::timestamptz, now())
+			WHERE state::text = ANY($2::text[])
+			  AND state != 'running'::%s
+			  AND NOT (
+				state = 'available'::%s
+				AND scheduled_at < coalesce($1::timestamptz, now())
+			  )
+			RETURNING 1
+		)
+		SELECT to_json(count(*)) FROM updated
+	`, qt(params.Schema, "river_job"), qt(params.Schema, "river_job_state"), qt(params.Schema, "river_job_state"), qt(params.Schema, "river_job_state")), params.Now, states)
 }
 func (e *Executor) JobGetAvailableLimited(ctx context.Context, params *JobGetAvailableLimitedParams) ([]*rivertype.JobRow, error) {
 	if e == nil || e.Executor == nil {

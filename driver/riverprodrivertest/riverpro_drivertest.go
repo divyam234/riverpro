@@ -1109,6 +1109,24 @@ func exerciseDocumentedExecutorAPI[TTx any](ctx context.Context, t *testing.T,
 		require.NoError(t, err)
 		require.Len(t, deletedMany, 1)
 
+		discardedAt := now.Add(-time.Minute)
+		discardedA := insertJob(ctx, t, exec, schema, "retry-many-a", rivertype.JobStateDiscarded, []byte(`{}`), []byte(`{}`), &discardedAt)
+		discardedB := insertJob(ctx, t, exec, schema, "retry-many-b", rivertype.JobStateDiscarded, []byte(`{}`), []byte(`{}`), &discardedAt)
+		completed := insertJob(ctx, t, exec, schema, "retry-many-completed", rivertype.JobStateCompleted, []byte(`{}`), []byte(`{}`), &discardedAt)
+		bulkRetried, err := exec.JobRetryMany(ctx, &driver.JobRetryManyParams{Now: &now, Schema: schema, States: []rivertype.JobState{rivertype.JobStateDiscarded}})
+		require.NoError(t, err)
+		require.Equal(t, 2, bulkRetried)
+		rows, err := exec.JobGetByIDMany(ctx, &riverdriver.JobGetByIDManyParams{ID: []int64{discardedA.ID, discardedB.ID, completed.ID}, Schema: schema})
+		require.NoError(t, err)
+		require.Len(t, rows, 3)
+		statesByID := map[int64]rivertype.JobState{}
+		for _, row := range rows {
+			statesByID[row.ID] = row.State
+		}
+		require.Equal(t, rivertype.JobStateAvailable, statesByID[discardedA.ID])
+		require.Equal(t, rivertype.JobStateAvailable, statesByID[discardedB.ID])
+		require.Equal(t, rivertype.JobStateCompleted, statesByID[completed.ID])
+
 		oldDone := now.Add(-2 * time.Hour)
 		_ = insertJob(ctx, t, exec, schema, "delete-before", rivertype.JobStateCompleted, []byte(`{}`), []byte(`{}`), &oldDone)
 		deletedBefore, err := exec.JobDeleteNonWorkflowBefore(ctx, &driver.JobDeleteNonWorkflowBeforeParams{CompletedDoDelete: true, CompletedFinalizedAtHorizon: now.Add(-time.Hour), Max: 10, Schema: schema})
