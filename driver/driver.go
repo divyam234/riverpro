@@ -77,6 +77,7 @@ type ProExecutor interface {
 	JobGetAvailableLimited(ctx context.Context, params *JobGetAvailableLimitedParams) ([]*rivertype.JobRow, error)
 	JobGetAvailablePartitionKeys(ctx context.Context, params *JobGetAvailablePartitionKeysParams) ([]string, error)
 	JobGetStuckWithInactiveProducer(ctx context.Context, params *JobGetStuckWithInactiveProducerParams) ([]*rivertype.JobRow, error)
+	JobGetRunningWithInactiveProducer(ctx context.Context, params *JobGetRunningWithInactiveProducerParams) ([]*rivertype.JobRow, error)
 	JobRescueManyWithInactiveProducer(ctx context.Context, params *JobRescueManyWithInactiveProducerParams) error
 	PGTryAdvisoryXactLock(ctx context.Context, key int64) (bool, error)
 	PeriodicJobGetAll(ctx context.Context, params *PeriodicJobGetAllParams) ([]*PeriodicJob, error)
@@ -275,10 +276,21 @@ type JobGetStuckWithInactiveProducerParams struct {
 	ProducerStaleHorizon time.Time
 }
 
-// JobRescueManyWithInactiveProducerParams guards a rescue update with the same
-// age-or-inactive-producer condition used to select the jobs.
+// JobGetRunningWithInactiveProducerParams selects running jobs whose latest
+// producer heartbeat is stale or missing, independent of the job timeout.
+type JobGetRunningWithInactiveProducerParams struct {
+	AfterID              int64
+	Max                  int
+	ProducerStaleHorizon time.Time
+	Schema               string
+}
+
+// JobRescueManyWithInactiveProducerParams guards a rescue update against
+// producer recovery. When InactiveProducerOnly is false, River's normal
+// age-based stuck condition is also accepted.
 type JobRescueManyWithInactiveProducerParams struct {
 	*riverdriver.JobRescueManyParams
+	InactiveProducerOnly bool
 	ProducerStaleHorizon time.Time
 }
 
@@ -2063,27 +2075,56 @@ func (e *Executor) JobGetStuckWithInactiveProducer(ctx context.Context, params *
 		return []*rivertype.JobRow{}, nil
 	}
 	schema := params.Schema
-	return scanJSON[[]*rivertype.JobRow](ctx, e.Executor, fmt.Sprintf(`
-		SELECT coalesce(json_agg(%[1]s ORDER BY j.id), '[]'::json)
-		FROM (
-			SELECT j.*
-			FROM %[2]s AS j
-			LEFT JOIN %[3]s AS p
-			  ON p.client_id = j.attempted_by[array_length(j.attempted_by, 1)]
-			 AND p.queue_name = j.queue
-			WHERE j.state = 'running'::%[4]s
-			  AND j.id > $1
-			  AND (
-				j.attempted_at < $2
-				OR (
-					coalesce(array_length(j.attempted_by, 1), 0) > 0
-					AND (p.id IS NULL OR p.updated_at < $3)
+	where := fmt.Sprintf(`
+		state = 'running'
+		AND id > @after_id
+		AND (
+			attempted_at < @stuck_horizon
+			OR (
+				coalesce(array_length(attempted_by, 1), 0) > 0
+				AND NOT EXISTS (
+					SELECT 1 FROM %s AS p
+					WHERE p.client_id = attempted_by[array_length(attempted_by, 1)]
+					  AND p.queue_name = queue
+					  AND p.updated_at >= @producer_stale_horizon
 				)
-			  )
-			ORDER BY j.id
-			LIMIT $4
-		) AS j
-	`, jobRowJSONObjectSQL("j"), qt(schema, "river_job"), qt(schema, "river_producer"), qt(schema, "river_job_state")), params.AfterID, params.StuckHorizon, params.ProducerStaleHorizon, params.Max)
+			)
+		)
+	`, qt(schema, "river_producer"))
+	return e.Executor.JobList(ctx, &riverdriver.JobListParams{
+		Max:           int32(params.Max),
+		NamedArgs:     map[string]any{"after_id": params.AfterID, "stuck_horizon": params.StuckHorizon, "producer_stale_horizon": params.ProducerStaleHorizon},
+		OrderByClause: "id",
+		Schema:        schema,
+		WhereClause:   where,
+	})
+}
+
+func (e *Executor) JobGetRunningWithInactiveProducer(ctx context.Context, params *JobGetRunningWithInactiveProducerParams) ([]*rivertype.JobRow, error) {
+	if e == nil || e.Executor == nil {
+		return nil, errors.New("riverpro driver: nil executor")
+	}
+	if params == nil || params.Max <= 0 {
+		return []*rivertype.JobRow{}, nil
+	}
+	where := fmt.Sprintf(`
+		state = 'running'
+		AND id > @after_id
+		AND coalesce(array_length(attempted_by, 1), 0) > 0
+		AND NOT EXISTS (
+			SELECT 1 FROM %s AS p
+			WHERE p.client_id = attempted_by[array_length(attempted_by, 1)]
+			  AND p.queue_name = queue
+			  AND p.updated_at >= @producer_stale_horizon
+		)
+	`, qt(params.Schema, "river_producer"))
+	return e.Executor.JobList(ctx, &riverdriver.JobListParams{
+		Max:           int32(params.Max),
+		NamedArgs:     map[string]any{"after_id": params.AfterID, "producer_stale_horizon": params.ProducerStaleHorizon},
+		OrderByClause: "id",
+		Schema:        params.Schema,
+		WhereClause:   where,
+	})
 }
 
 func (e *Executor) JobRescueManyWithInactiveProducer(ctx context.Context, params *JobRescueManyWithInactiveProducerParams) error {
@@ -2117,7 +2158,7 @@ func (e *Executor) JobRescueManyWithInactiveProducer(ctx context.Context, params
 		WHERE j.id = updated.id
 		  AND j.state = 'running'::%[2]s
 		  AND (
-			j.attempted_at < $6
+			(NOT $8::boolean AND j.attempted_at < $6)
 			OR (
 				coalesce(array_length(j.attempted_by, 1), 0) > 0
 				AND NOT EXISTS (
@@ -2128,7 +2169,7 @@ func (e *Executor) JobRescueManyWithInactiveProducer(ctx context.Context, params
 				)
 			)
 		  )
-	`, qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_producer")), params.ID, params.Error, params.FinalizedAt, params.ScheduledAt, params.State, params.StuckHorizon, params.ProducerStaleHorizon)
+	`, qt(schema, "river_job"), qt(schema, "river_job_state"), qt(schema, "river_producer")), params.ID, params.Error, params.FinalizedAt, params.ScheduledAt, params.State, params.StuckHorizon, params.ProducerStaleHorizon, params.InactiveProducerOnly)
 }
 
 func jobConcurrencyPartitionKeySQL(alias string, byKind bool, byArgs []string) string {

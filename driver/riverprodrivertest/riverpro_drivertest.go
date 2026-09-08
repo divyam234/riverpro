@@ -590,6 +590,7 @@ func exerciseActiveJobRescue[TTx any](ctx context.Context, t *testing.T,
 		require.NoError(t, exec.Exec(ctx, fmt.Sprintf(`UPDATE %s SET attempted_at = $1, attempted_by = ARRAY[$2] WHERE id = $3`, qname(schema, "river_job")), freshAttempt, "missing-owner", missingJob.ID))
 		require.NoError(t, exec.Exec(ctx, fmt.Sprintf(`UPDATE %s SET attempted_at = $1, attempted_by = ARRAY[$2] WHERE id = $3`, qname(schema, "river_job")), freshAttempt, stale.ClientID, staleJob.ID))
 		require.NoError(t, exec.Exec(ctx, fmt.Sprintf(`UPDATE %s SET attempted_at = $1, attempted_by = ARRAY[$2] WHERE id = $3`, qname(schema, "river_job")), freshAttempt, live.ClientID, liveJob.ID))
+		require.NoError(t, exec.Exec(ctx, fmt.Sprintf(`UPDATE %s SET unique_states = B'11110101' WHERE id = $1`, qname(schema, "river_job")), missingJob.ID))
 
 		jobs, err := exec.JobGetStuckWithInactiveProducer(ctx, &driver.JobGetStuckWithInactiveProducerParams{
 			JobGetStuckParams:    &riverdriver.JobGetStuckParams{Max: 10, Schema: schema, StuckHorizon: now.Add(-24 * time.Hour)},
@@ -597,6 +598,74 @@ func exerciseActiveJobRescue[TTx any](ctx context.Context, t *testing.T,
 		})
 		require.NoError(t, err)
 		require.ElementsMatch(t, []int64{missingJob.ID, staleJob.ID}, jobIDs(jobs))
+		for _, job := range jobs {
+			if job.ID == missingJob.ID {
+				require.NotEmpty(t, job.UniqueStates)
+			}
+		}
+
+		inactiveJobs, err := exec.JobGetRunningWithInactiveProducer(ctx, &driver.JobGetRunningWithInactiveProducerParams{
+			Max:                  10,
+			ProducerStaleHorizon: now.Add(-30 * time.Minute),
+			Schema:               schema,
+		})
+		require.NoError(t, err)
+		require.ElementsMatch(t, []int64{missingJob.ID, staleJob.ID}, jobIDs(inactiveJobs))
+	})
+
+	t.Run("ActiveJobRescueUpdatesMissingProducerJob", func(t *testing.T) {
+		t.Parallel()
+		exec, schema := execSchema(ctx, t, executorWithTx)
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		freshAttempt := now.Add(-time.Minute)
+		job := insertJob(ctx, t, exec, schema, "missing-owner-rescue-kind", rivertype.JobStateRunning, []byte(`{}`), []byte(`{}`), nil)
+		require.NoError(t, exec.Exec(ctx, fmt.Sprintf(`UPDATE %s SET attempted_at = $1, attempted_by = ARRAY[$2] WHERE id = $3`, qname(schema, "river_job")), freshAttempt, "missing-owner", job.ID))
+
+		err := exec.JobRescueManyWithInactiveProducer(ctx, &driver.JobRescueManyWithInactiveProducerParams{
+			JobRescueManyParams: &riverdriver.JobRescueManyParams{
+				ID:           []int64{job.ID},
+				Error:        [][]byte{[]byte(`{"at":"2026-01-01T00:00:00Z","attempt":1,"error":"rescued","trace":""}`)},
+				FinalizedAt:  []*time.Time{nil},
+				ScheduledAt:  []time.Time{now},
+				Schema:       schema,
+				State:        []string{string(rivertype.JobStateRetryable)},
+				StuckHorizon: now.Add(-24 * time.Hour),
+			},
+			InactiveProducerOnly: true,
+			ProducerStaleHorizon: now.Add(-30 * time.Minute),
+		})
+		require.NoError(t, err)
+
+		jobs, err := exec.JobList(ctx, &riverdriver.JobListParams{Max: 1, NamedArgs: map[string]any{"id": job.ID}, OrderByClause: "id", Schema: schema, WhereClause: "id = @id"})
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		require.Equal(t, rivertype.JobStateRetryable, jobs[0].State)
+		require.Nil(t, jobs[0].FinalizedAt)
+	})
+
+	t.Run("ActiveJobRescueSkipsRecoveredProducer", func(t *testing.T) {
+		t.Parallel()
+		exec, schema := execSchema(ctx, t, executorWithTx)
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		job := insertJob(ctx, t, exec, schema, "recovered-owner-rescue-kind", rivertype.JobStateRunning, []byte(`{}`), []byte(`{}`), nil)
+		require.NoError(t, exec.Exec(ctx, fmt.Sprintf(`UPDATE %s SET attempted_at = $1, attempted_by = ARRAY[$2] WHERE id = $3`, qname(schema, "river_job")), now.Add(-time.Minute), "recovered-owner", job.ID))
+		_, err := exec.ProducerInsertOrUpdate(ctx, &driver.ProducerInsertOrUpdateParams{ClientID: "recovered-owner", MaxWorkers: 1, QueueName: "default", Schema: schema, UpdatedAt: &now})
+		require.NoError(t, err)
+
+		err = exec.JobRescueManyWithInactiveProducer(ctx, &driver.JobRescueManyWithInactiveProducerParams{
+			JobRescueManyParams: &riverdriver.JobRescueManyParams{
+				ID: []int64{job.ID}, Error: [][]byte{[]byte(`{"at":"2026-01-01T00:00:00Z","attempt":1,"error":"rescued","trace":""}`)},
+				FinalizedAt: []*time.Time{nil}, ScheduledAt: []time.Time{now}, Schema: schema,
+				State: []string{string(rivertype.JobStateRetryable)}, StuckHorizon: now.Add(-24 * time.Hour),
+			},
+			InactiveProducerOnly: true,
+			ProducerStaleHorizon: now.Add(-30 * time.Minute),
+		})
+		require.NoError(t, err)
+		jobs, err := exec.JobList(ctx, &riverdriver.JobListParams{Max: 1, NamedArgs: map[string]any{"id": job.ID}, OrderByClause: "id", Schema: schema, WhereClause: "id = @id"})
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		require.Equal(t, rivertype.JobStateRunning, jobs[0].State)
 	})
 }
 

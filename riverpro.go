@@ -53,6 +53,7 @@ type Config struct {
 	ProducerRetentionEnabled         bool
 	ProducerRetentionInterval        time.Duration
 	ProducerStaleRetentionPeriod     time.Duration
+	ProducerCrashRescueInterval      time.Duration
 	ProQueues                        map[string]QueueConfig
 	SequenceSchedulerInterval        time.Duration
 	WorkflowAwareRetention           bool
@@ -96,6 +97,9 @@ func (c *Config) WithDefaults() *Config {
 	}
 	if c.ProducerStaleRetentionPeriod == 0 {
 		c.ProducerStaleRetentionPeriod = 30 * time.Minute
+	}
+	if c.ProducerCrashRescueInterval == 0 {
+		c.ProducerCrashRescueInterval = 30 * time.Second
 	}
 	if c.ProducerRetentionInterval == 0 {
 		c.ProducerRetentionInterval = 5 * time.Minute

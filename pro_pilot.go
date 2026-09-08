@@ -16,6 +16,7 @@ import (
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivershared/baseservice"
 	"github.com/riverqueue/river/rivershared/riverpilot"
+	"github.com/riverqueue/river/rivershared/startstop"
 	"github.com/riverqueue/river/rivertype"
 
 	prodriver "github.com/divyam234/riverpro/driver"
@@ -29,6 +30,7 @@ const (
 	metadataKeySequenceContinueOnCancelled = "riverpro_sequence_continue_on_cancelled"
 	metadataKeySequenceContinueOnDiscarded = "riverpro_sequence_continue_on_discarded"
 	producerShutdownTimeout                = 5 * time.Second
+	producerCrashRescueBatchSize           = 1000
 )
 
 type sequenceInsertJob struct {
@@ -39,9 +41,10 @@ type sequenceInsertJob struct {
 
 type proPilot[TTx any] struct {
 	riverpilot.StandardPilot
-	config *Config
-	driver prodriver.ProDriver[TTx]
-	params *riverpilot.PilotInitParams
+	archetype *baseservice.Archetype
+	config    *Config
+	driver    prodriver.ProDriver[TTx]
+	params    *riverpilot.PilotInitParams
 }
 
 func newProPilot[TTx any](driver prodriver.ProDriver[TTx], config *Config) *proPilot[TTx] {
@@ -49,8 +52,139 @@ func newProPilot[TTx any](driver prodriver.ProDriver[TTx], config *Config) *proP
 }
 
 func (p *proPilot[TTx]) PilotInit(archetype *baseservice.Archetype, params *riverpilot.PilotInitParams) {
+	p.archetype = archetype
 	p.params = params
 	p.StandardPilot.PilotInit(archetype, params)
+}
+
+type crashRescueMetadata struct {
+	CancelAttemptedAt time.Time `json:"cancel_attempted_at"`
+}
+
+func (p *proPilot[TTx]) PluginMaintenanceServices() []startstop.Service {
+	if p == nil || p.config == nil || p.config.ProducerCrashRescueInterval < 0 || p.config.ProducerStaleRetentionPeriod < 0 {
+		return nil
+	}
+	return []startstop.Service{startstop.StartStopFunc(func(ctx context.Context, shouldStart bool, started, stopped func()) error {
+		if !shouldStart {
+			return nil
+		}
+		go func() {
+			started()
+			defer stopped()
+
+			run := func() {
+				count, err := p.crashRescueOnce(ctx)
+				if err != nil {
+					if p.archetype != nil && p.archetype.Logger != nil && !errors.Is(err, context.Canceled) {
+						p.archetype.Logger.ErrorContext(ctx, "riverpro: error rescuing jobs from inactive producers", "error", err)
+					}
+					return
+				}
+				if count > 0 && p.archetype != nil && p.archetype.Logger != nil {
+					p.archetype.Logger.InfoContext(ctx, "riverpro: rescued jobs from inactive producers", "count", count)
+				}
+			}
+
+			run()
+			ticker := time.NewTicker(p.config.ProducerCrashRescueInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					run()
+				}
+			}
+		}()
+		return nil
+	})}
+}
+
+func (p *proPilot[TTx]) PluginServices() []startstop.Service { return nil }
+
+func (p *proPilot[TTx]) crashRescueOnce(ctx context.Context) (int, error) {
+	if p == nil || p.config == nil || p.driver == nil {
+		return 0, nil
+	}
+	now := time.Now().UTC()
+	staleHorizon := now.Add(-p.config.ProducerStaleRetentionPeriod)
+	exec := p.driver.GetProExecutor()
+	var afterID int64
+	rescued := 0
+
+	for {
+		jobs, err := exec.JobGetRunningWithInactiveProducer(ctx, &prodriver.JobGetRunningWithInactiveProducerParams{
+			AfterID:              afterID,
+			Max:                  producerCrashRescueBatchSize,
+			ProducerStaleHorizon: staleHorizon,
+			Schema:               p.config.Schema,
+		})
+		if err != nil {
+			return rescued, err
+		}
+		if len(jobs) == 0 {
+			return rescued, nil
+		}
+		afterID = jobs[len(jobs)-1].ID
+
+		params := &riverdriver.JobRescueManyParams{
+			ID:           make([]int64, 0, len(jobs)),
+			Error:        make([][]byte, 0, len(jobs)),
+			FinalizedAt:  make([]*time.Time, 0, len(jobs)),
+			ScheduledAt:  make([]time.Time, 0, len(jobs)),
+			Schema:       p.config.Schema,
+			State:        make([]string, 0, len(jobs)),
+			StuckHorizon: time.Time{},
+		}
+		for _, job := range jobs {
+			var metadata crashRescueMetadata
+			if err := json.Unmarshal(job.Metadata, &metadata); err != nil {
+				return rescued, fmt.Errorf("decode job %d metadata: %w", job.ID, err)
+			}
+			errorData, err := json.Marshal(rivertype.AttemptError{
+				At:      now,
+				Attempt: max(job.Attempt, 0),
+				Error:   "Job rescued after producer became inactive",
+				Trace:   "",
+			})
+			if err != nil {
+				return rescued, err
+			}
+
+			state := rivertype.JobStateRetryable
+			var finalizedAt *time.Time
+			scheduledAt := now
+			switch {
+			case !metadata.CancelAttemptedAt.IsZero():
+				state = rivertype.JobStateCancelled
+				finalizedAt = &now
+				scheduledAt = job.ScheduledAt
+			case job.Attempt >= max(job.MaxAttempts, 0):
+				state = rivertype.JobStateDiscarded
+				finalizedAt = &now
+				scheduledAt = job.ScheduledAt
+			}
+			params.ID = append(params.ID, job.ID)
+			params.Error = append(params.Error, errorData)
+			params.FinalizedAt = append(params.FinalizedAt, finalizedAt)
+			params.ScheduledAt = append(params.ScheduledAt, scheduledAt)
+			params.State = append(params.State, string(state))
+		}
+
+		if err := exec.JobRescueManyWithInactiveProducer(ctx, &prodriver.JobRescueManyWithInactiveProducerParams{
+			JobRescueManyParams:  params,
+			InactiveProducerOnly: true,
+			ProducerStaleHorizon: staleHorizon,
+		}); err != nil {
+			return rescued, err
+		}
+		rescued += len(jobs)
+		if len(jobs) < producerCrashRescueBatchSize {
+			return rescued, nil
+		}
+	}
 }
 
 func (p *proPilot[TTx]) JobInsertMany(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobInsertFastManyParams) ([]*riverdriver.JobInsertFastResult, error) {
@@ -140,32 +274,11 @@ func (p *proPilot[TTx]) JobGetAvailable(ctx context.Context, exec riverdriver.Ex
 }
 
 func (p *proPilot[TTx]) JobGetStuck(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobGetStuckParams) ([]*rivertype.JobRow, error) {
-	if params == nil {
-		return nil, nil
-	}
-	staleAfter := 30 * time.Minute
-	if p != nil && p.config != nil && p.config.ProducerStaleRetentionPeriod > 0 {
-		staleAfter = p.config.ProducerStaleRetentionPeriod
-	}
-	return (&prodriver.Executor{Executor: exec}).JobGetStuckWithInactiveProducer(ctx, &prodriver.JobGetStuckWithInactiveProducerParams{
-		JobGetStuckParams:    params,
-		ProducerStaleHorizon: time.Now().Add(-staleAfter),
-	})
+	return p.StandardPilot.JobGetStuck(ctx, exec, params)
 }
 
 func (p *proPilot[TTx]) JobRescueMany(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobRescueManyParams) (*struct{}, error) {
-	if params == nil {
-		return &struct{}{}, nil
-	}
-	staleAfter := 30 * time.Minute
-	if p != nil && p.config != nil && p.config.ProducerStaleRetentionPeriod > 0 {
-		staleAfter = p.config.ProducerStaleRetentionPeriod
-	}
-	err := (&prodriver.Executor{Executor: exec}).JobRescueManyWithInactiveProducer(ctx, &prodriver.JobRescueManyWithInactiveProducerParams{
-		JobRescueManyParams:  params,
-		ProducerStaleHorizon: time.Now().Add(-staleAfter),
-	})
-	return &struct{}{}, err
+	return p.StandardPilot.JobRescueMany(ctx, exec, params)
 }
 
 func (p *proPilot[TTx]) JobSetStateIfRunningMany(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobSetStateIfRunningManyParams) ([]*rivertype.JobRow, error) {

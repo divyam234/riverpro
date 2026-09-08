@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -366,6 +367,121 @@ func TestProFeatureMatrix_CrashedClientLeavesStaleProducerAndReaperCleansIt(t *t
 			return false
 		}
 		return len(rows) == 0
+	})
+}
+
+func TestProFeatureMatrix_CrashRescuerDecisions(t *testing.T) {
+	ctx := context.Background()
+	cfg := &Config{
+		ProducerCrashRescueInterval:  30 * time.Second,
+		ProducerStaleRetentionPeriod: 5 * time.Minute,
+		Config: river.Config{
+			JobTimeout:           24 * time.Hour,
+			RescueStuckJobsAfter: 24 * time.Hour,
+		},
+	}
+	_, drv, schema := newMatrixClient(t, ctx, cfg)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	staleAt := now.Add(-time.Hour)
+
+	_, err := drv.GetProExecutor().ProducerInsertOrUpdate(ctx, &prodriver.ProducerInsertOrUpdateParams{ClientID: "stale-owner", MaxWorkers: 1, QueueName: river.QueueDefault, Schema: schema, UpdatedAt: &staleAt})
+	require.NoError(t, err)
+	_, err = drv.GetProExecutor().ProducerInsertOrUpdate(ctx, &prodriver.ProducerInsertOrUpdateParams{ClientID: "live-owner", MaxWorkers: 1, QueueName: river.QueueDefault, Schema: schema, UpdatedAt: &now})
+	require.NoError(t, err)
+
+	insertRunning := func(kind, owner string, attempt, maxAttempts int, metadata []byte) *rivertype.JobRow {
+		t.Helper()
+		attemptedAt := now.Add(-time.Minute)
+		job, err := drv.GetExecutor().JobInsertFull(ctx, &riverdriver.JobInsertFullParams{
+			CreatedAt: &attemptedAt, EncodedArgs: []byte(`{}`), Kind: kind, MaxAttempts: maxAttempts,
+			Priority: 1, Metadata: metadata, Queue: river.QueueDefault, ScheduledAt: &attemptedAt, Schema: schema, State: rivertype.JobStateRunning,
+		})
+		require.NoError(t, err)
+		require.NoError(t, drv.GetExecutor().Exec(ctx, fmt.Sprintf(`UPDATE %s.river_job SET attempt = $1, attempted_at = $2, attempted_by = ARRAY[$3] WHERE id = $4`, pgx.Identifier{schema}.Sanitize()), attempt, attemptedAt, owner, job.ID))
+		return job
+	}
+
+	missingRetry := insertRunning("crash-missing-retry", "missing-owner", 1, 3, []byte(`{}`))
+	staleRetry := insertRunning("crash-stale-retry", "stale-owner", 1, 3, []byte(`{}`))
+	exhausted := insertRunning("crash-exhausted", "missing-owner", 3, 3, []byte(`{}`))
+	cancelled := insertRunning("crash-cancelled", "missing-owner", 1, 3, []byte(fmt.Sprintf(`{"cancel_attempted_at":%q}`, now.Format(time.RFC3339Nano))))
+	live := insertRunning("crash-live", "live-owner", 1, 3, []byte(`{}`))
+
+	pilot := newProPilot(drv, cfg.WithDefaults())
+	rescued, err := pilot.crashRescueOnce(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 4, rescued)
+
+	assertState := func(job *rivertype.JobRow, state rivertype.JobState) *rivertype.JobRow {
+		t.Helper()
+		got, err := drv.GetExecutor().JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: schema})
+		require.NoError(t, err)
+		require.Equal(t, state, got.State)
+		return got
+	}
+	require.Nil(t, assertState(missingRetry, rivertype.JobStateRetryable).FinalizedAt)
+	require.Nil(t, assertState(staleRetry, rivertype.JobStateRetryable).FinalizedAt)
+	require.NotNil(t, assertState(exhausted, rivertype.JobStateDiscarded).FinalizedAt)
+	require.NotNil(t, assertState(cancelled, rivertype.JobStateCancelled).FinalizedAt)
+	assertState(live, rivertype.JobStateRunning)
+}
+
+func TestProFeatureMatrix_CrashRescuerPluginRunsBeforeJobTimeout(t *testing.T) {
+	ctx := context.Background()
+	workers := river.NewWorkers()
+	river.AddWorker(workers, river.WorkFunc(func(ctx context.Context, job *river.Job[matrixNoopArgs]) error { return nil }))
+	client, drv, schema := newMatrixClient(t, ctx, &Config{
+		ProducerCrashRescueInterval:  50 * time.Millisecond,
+		ProducerStaleRetentionPeriod: time.Second,
+		Config: river.Config{
+			Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}},
+			JobTimeout: 24 * time.Hour, RescueStuckJobsAfter: 24 * time.Hour,
+		},
+	})
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	job, err := drv.GetExecutor().JobInsertFull(ctx, &riverdriver.JobInsertFullParams{
+		CreatedAt: &now, EncodedArgs: []byte(`{}`), Kind: matrixNoopArgs{}.Kind(), MaxAttempts: 1,
+		Priority: 1, Metadata: []byte(`{}`), Queue: river.QueueDefault, ScheduledAt: &now, Schema: schema, State: rivertype.JobStateRunning,
+	})
+	require.NoError(t, err)
+	require.NoError(t, drv.GetExecutor().Exec(ctx, fmt.Sprintf(`UPDATE %s.river_job SET attempt = 1, attempted_at = $1, attempted_by = ARRAY[$2] WHERE id = $3`, pgx.Identifier{schema}.Sanitize()), now, "missing-owner", job.ID))
+
+	require.NoError(t, client.Start(ctx))
+	t.Cleanup(func() { _ = client.Stop(context.Background()) })
+	waitMatrix(t, func() bool {
+		got, err := drv.GetExecutor().JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: schema})
+		return err == nil && got.State == rivertype.JobStateDiscarded
+	})
+}
+
+func TestProFeatureMatrix_NormalTimeoutRescueStillUsesCoreRiver(t *testing.T) {
+	ctx := context.Background()
+	workers := river.NewWorkers()
+	river.AddWorker(workers, river.WorkFunc(func(ctx context.Context, job *river.Job[matrixNoopArgs]) error { return nil }))
+	client, drv, schema := newMatrixClient(t, ctx, &Config{
+		ProducerCrashRescueInterval:  50 * time.Millisecond,
+		ProducerStaleRetentionPeriod: 24 * time.Hour,
+		Config: river.Config{
+			Workers: workers, Queues: map[string]river.QueueConfig{river.QueueDefault: {MaxWorkers: 1}},
+			JobTimeout: time.Second, RescueStuckJobsAfter: time.Second,
+		},
+	})
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	attemptedAt := now.Add(-time.Hour)
+	_, err := drv.GetProExecutor().ProducerInsertOrUpdate(ctx, &prodriver.ProducerInsertOrUpdateParams{ClientID: "live-timeout-owner", MaxWorkers: 1, QueueName: river.QueueDefault, Schema: schema, UpdatedAt: &now})
+	require.NoError(t, err)
+	job, err := drv.GetExecutor().JobInsertFull(ctx, &riverdriver.JobInsertFullParams{
+		CreatedAt: &attemptedAt, EncodedArgs: []byte(`{}`), Kind: matrixNoopArgs{}.Kind(), MaxAttempts: 1,
+		Priority: 1, Metadata: []byte(`{}`), Queue: river.QueueDefault, ScheduledAt: &attemptedAt, Schema: schema, State: rivertype.JobStateRunning,
+	})
+	require.NoError(t, err)
+	require.NoError(t, drv.GetExecutor().Exec(ctx, fmt.Sprintf(`UPDATE %s.river_job SET attempt = 1, attempted_at = $1, attempted_by = ARRAY[$2] WHERE id = $3`, pgx.Identifier{schema}.Sanitize()), attemptedAt, "live-timeout-owner", job.ID))
+
+	require.NoError(t, client.Start(ctx))
+	t.Cleanup(func() { _ = client.Stop(context.Background()) })
+	waitMatrix(t, func() bool {
+		got, err := drv.GetExecutor().JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID, Schema: schema})
+		return err == nil && got.State == rivertype.JobStateDiscarded
 	})
 }
 

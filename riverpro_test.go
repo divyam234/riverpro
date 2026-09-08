@@ -120,12 +120,15 @@ func TestConfigWithDefaultsWorkflowAwareRetention(t *testing.T) {
 }
 
 func TestConfigWithDefaultsProducerRetention(t *testing.T) {
-	cfg := (&Config{ProducerRetentionEnabled: true, ProducerStaleRetentionPeriod: 5 * time.Minute, ProducerRetentionInterval: time.Minute}).WithDefaults()
+	cfg := (&Config{ProducerRetentionEnabled: true, ProducerStaleRetentionPeriod: 5 * time.Minute, ProducerRetentionInterval: time.Minute, ProducerCrashRescueInterval: 15 * time.Second}).WithDefaults()
 	if !cfg.ProducerRetentionEnabled {
 		t.Fatal("ProducerRetentionEnabled should be preserved through WithDefaults")
 	}
 	if cfg.ProducerStaleRetentionPeriod != 5*time.Minute {
 		t.Fatalf("ProducerStaleRetentionPeriod should be preserved, got %s", cfg.ProducerStaleRetentionPeriod)
+	}
+	if cfg.ProducerCrashRescueInterval != 15*time.Second {
+		t.Fatalf("ProducerCrashRescueInterval should be preserved, got %s", cfg.ProducerCrashRescueInterval)
 	}
 	if cfg.ProducerRetentionInterval != time.Minute {
 		t.Fatalf("ProducerRetentionInterval should be preserved, got %s", cfg.ProducerRetentionInterval)
@@ -137,6 +140,9 @@ func TestConfigWithDefaultsProducerRetention(t *testing.T) {
 	}
 	if cfg.ProducerStaleRetentionPeriod != 30*time.Minute {
 		t.Fatalf("ProducerStaleRetentionPeriod should default to 30m, got %s", cfg.ProducerStaleRetentionPeriod)
+	}
+	if cfg.ProducerCrashRescueInterval != 30*time.Second {
+		t.Fatalf("ProducerCrashRescueInterval should default to 30s, got %s", cfg.ProducerCrashRescueInterval)
 	}
 	if cfg.ProducerRetentionInterval != 5*time.Minute {
 		t.Fatalf("ProducerRetentionInterval should default to 5m, got %s", cfg.ProducerRetentionInterval)
