@@ -3,7 +3,7 @@ module github.com/divyam234/riverpro
 go 1.26.0
 
 require (
-	github.com/jackc/pgx/v5 v5.10.0
+	github.com/jackc/pgx/v5 v5.11.0
 	github.com/riverqueue/river v0.47.0
 	github.com/riverqueue/river/riverdriver v0.47.0
 	github.com/riverqueue/river/riverdriver/riverdatabasesql v0.47.0
