@@ -1017,6 +1017,28 @@ func exerciseConcurrencyLimits[TTx any](ctx context.Context, t *testing.T,
 		require.Equal(t, kindA.ID, jobs[0].ID)
 	})
 
+	t.Run("ConcurrencyLimitedFetchRespectsKindFilter", func(t *testing.T) {
+		t.Parallel()
+		exec, schema := execSchema(ctx, t, executorWithTx)
+		kindA := insertJob(ctx, t, exec, schema, "kind-filter-a", rivertype.JobStateAvailable, []byte(`{}`), []byte(`{}`), nil)
+		kindB := insertJob(ctx, t, exec, schema, "kind-filter-b", rivertype.JobStateAvailable, []byte(`{}`), []byte(`{}`), nil)
+
+		limited := func(kind []string) *driver.JobGetAvailableLimitedParams {
+			return &driver.JobGetAvailableLimitedParams{GlobalLimit: 5, JobGetAvailableParams: &riverdriver.JobGetAvailableParams{Kind: kind}}
+		}
+
+		jobs := fetch(ctx, t, exec, schema, "client-kind-a", limited([]string{"kind-filter-a"}))
+		require.Len(t, jobs, 1)
+		require.Equal(t, kindA.ID, jobs[0].ID)
+
+		jobs = fetch(ctx, t, exec, schema, "client-kind-empty", limited([]string{}))
+		require.Empty(t, jobs, "empty kind filter must match no jobs")
+
+		jobs = fetch(ctx, t, exec, schema, "client-kind-nil", limited(nil))
+		require.Len(t, jobs, 1)
+		require.Equal(t, kindB.ID, jobs[0].ID)
+	})
+
 	t.Run("ConcurrencyLimitedFetchRespectsPausedQueue", func(t *testing.T) {
 		t.Parallel()
 		exec, schema := execSchema(ctx, t, executorWithTx)

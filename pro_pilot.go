@@ -246,7 +246,7 @@ func (p *proPilot[TTx]) JobInsertMany(ctx context.Context, exec riverdriver.Exec
 	return p.StandardPilot.JobInsertMany(ctx, exec, params)
 }
 
-func (p *proPilot[TTx]) JobGetAvailable(ctx context.Context, exec riverdriver.Executor, state riverpilot.ProducerState, params *riverdriver.JobGetAvailableParams) ([]*rivertype.JobRow, error) {
+func (p *proPilot[TTx]) JobGetAvailable(ctx context.Context, exec riverdriver.Executor, state riverpilot.ProducerState, params *riverdriver.JobGetAvailableParams) (*riverdriver.JobGetAvailableResult, error) {
 	if params == nil {
 		return nil, nil
 	}
@@ -263,12 +263,13 @@ func (p *proPilot[TTx]) JobGetAvailable(ctx context.Context, exec riverdriver.Ex
 			limitedParams.CurrentProducerPartitionKeys, limitedParams.CurrentProducerPartitionRunningCounts = producerState.snapshot()
 		}
 		jobs, err := (&prodriver.Executor{Executor: exec}).JobGetAvailableLimited(ctx, limitedParams)
-		if err == nil {
-			if producerState, ok := state.(*proProducerState); ok {
-				producerState.add(jobs)
-			}
+		if err != nil {
+			return nil, err
 		}
-		return jobs, err
+		if producerState, ok := state.(*proProducerState); ok {
+			producerState.add(jobs)
+		}
+		return &riverdriver.JobGetAvailableResult{Jobs: jobs}, nil
 	}
 	return p.StandardPilot.JobGetAvailable(ctx, exec, state, params)
 }

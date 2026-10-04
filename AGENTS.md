@@ -1,6 +1,6 @@
 # AGENTS.md
 
-River Pro — a Go extension on top of [River](https://github.com/riverqueue/river) v0.38.0 (job queue) adding BatchWorker, Sequences, Ephemeral jobs, Workflows, DeadLetter, Durable Periodic Jobs, and global/per-partition concurrency limits.
+River Pro — a Go extension on top of [River](https://github.com/riverqueue/river) v0.48.0 (job queue) adding BatchWorker, Sequences, Ephemeral jobs, Workflows, DeadLetter, Durable Periodic Jobs, and global/per-partition concurrency limits.
 
 ## Layout
 

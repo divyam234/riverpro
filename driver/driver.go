@@ -1934,8 +1934,21 @@ func (e *Executor) JobGetAvailableLimited(ctx context.Context, params *JobGetAva
 		return []*rivertype.JobRow{}, nil
 	}
 	base := params.JobGetAvailableParams
+	if base.Kind != nil && len(base.Kind) == 0 {
+		return []*rivertype.JobRow{}, nil
+	}
 	if params.GlobalLimit <= 0 && params.LocalLimit <= 0 {
-		return e.Executor.JobGetAvailable(ctx, base)
+		res, err := e.Executor.JobGetAvailable(ctx, base)
+		if err != nil {
+			return nil, err
+		}
+		if res == nil {
+			return []*rivertype.JobRow{}, nil
+		}
+		// Pro's limited-fetch API returns rows only; undecodable rows are
+		// still included in Jobs by the underlying driver, only the
+		// decode-error map is dropped here.
+		return res.Jobs, nil
 	}
 	if len(params.CurrentProducerPartitionKeys) != len(params.CurrentProducerPartitionRunningCounts) {
 		return nil, fmt.Errorf("riverpro driver: current producer partition key/count length mismatch: %d != %d", len(params.CurrentProducerPartitionKeys), len(params.CurrentProducerPartitionRunningCounts))
@@ -1959,6 +1972,7 @@ WITH available_partitions AS MATERIALIZED (
 		WHERE j.state = 'available'::%[3]s
 		  AND j.queue = $1
 		  AND j.scheduled_at <= $2
+		  AND ($14::text[] IS NULL OR j.kind = ANY($14::text[]))
 		  AND NOT EXISTS (SELECT 1 FROM %[6]s AS q WHERE q.name = $1 AND q.paused_at IS NOT NULL)
 	) available_partition_source
 	WHERE (coalesce(cardinality($5::text[]), 0) = 0 OR partition_key = ANY($5::text[]))
@@ -1978,6 +1992,7 @@ WITH available_partitions AS MATERIALIZED (
 	WHERE j.state = 'available'::%[3]s
 	  AND j.queue = $1
 	  AND j.scheduled_at <= $2
+	  AND ($14::text[] IS NULL OR j.kind = ANY($14::text[]))
 	  AND (coalesce(cardinality($5::text[]), 0) = 0 OR %[1]s = ANY($5::text[]))
 ), global_running_counts AS MATERIALIZED (
 	SELECT %[4]s AS partition_key, count(*)::integer AS running_count
@@ -2040,6 +2055,7 @@ WITH available_partitions AS MATERIALIZED (
 	  AND j.state = 'available'::%[3]s
 	  AND j.queue = $1
 	  AND j.scheduled_at <= $2
+	  AND ($14::text[] IS NULL OR j.kind = ANY($14::text[]))
 	  AND NOT EXISTS (SELECT 1 FROM %[6]s AS q WHERE q.name = $1 AND q.paused_at IS NOT NULL)
 	RETURNING j.*
 )
@@ -2060,6 +2076,7 @@ FROM updated_jobs AS j
 		base.ClientID,
 		len(params.CurrentProducerPartitionKeys) > 0,
 		fmt.Sprintf("%s:%s", schema, base.Queue),
+		base.Kind,
 	)
 	if err != nil {
 		return nil, err
