@@ -41,10 +41,11 @@ type sequenceInsertJob struct {
 
 type proPilot[TTx any] struct {
 	riverpilot.StandardPilot
-	archetype *baseservice.Archetype
-	config    *Config
-	driver    prodriver.ProDriver[TTx]
-	params    *riverpilot.PilotInitParams
+	archetype      *baseservice.Archetype
+	config         *Config
+	driver         prodriver.ProDriver[TTx]
+	params         *riverpilot.PilotInitParams
+	ephemeralKinds map[string]bool
 }
 
 func newProPilot[TTx any](driver prodriver.ProDriver[TTx], config *Config) *proPilot[TTx] {
@@ -54,7 +55,30 @@ func newProPilot[TTx any](driver prodriver.ProDriver[TTx], config *Config) *proP
 func (p *proPilot[TTx]) PilotInit(archetype *baseservice.Archetype, params *riverpilot.PilotInitParams) {
 	p.archetype = archetype
 	p.params = params
+	p.ephemeralKinds = registeredEphemeralKinds(p.config)
 	p.StandardPilot.PilotInit(archetype, params)
+}
+
+// River doesn't expose registered args through WorkerMetadata. Inspect only
+// their types (never private values) to recognize ephemeral kinds and aliases.
+func registeredEphemeralKinds(config *Config) map[string]bool {
+	kinds := map[string]bool{}
+	if config == nil || config.Workers == nil {
+		return kinds
+	}
+	workers := reflect.ValueOf(config.Workers).Elem().FieldByName("workersMap")
+	if !workers.IsValid() || workers.Kind() != reflect.Map {
+		return kinds
+	}
+	ephemeralType := reflect.TypeFor[JobArgsWithEphemeralOpts]()
+	iter := workers.MapRange()
+	for iter.Next() {
+		args := iter.Value().FieldByName("jobArgs")
+		if args.IsValid() && args.Kind() == reflect.Interface && !args.IsNil() && args.Elem().Type().Implements(ephemeralType) {
+			kinds[iter.Key().String()] = true
+		}
+	}
+	return kinds
 }
 
 type crashRescueMetadata struct {
@@ -298,7 +322,8 @@ func (p *proPilot[TTx]) JobSetStateIfRunningMany(ctx context.Context, exec river
 		if key, _ := meta[metadataKeySequenceKey].(string); key != "" && sequenceShouldContinue(job.State, meta) {
 			sequenceKeys[key] = true
 		}
-		if isTruthy(meta[metadataKeyEphemeral]) && job.State == rivertype.JobStateCompleted {
+		qc, _ := p.queueConfig(job.Queue)
+		if job.State == rivertype.JobStateCompleted && (p.ephemeralKinds[job.Kind] || qc.Ephemeral.Enabled || isTruthy(meta[metadataKeyEphemeral])) {
 			if _, deleteErr := exec.JobDelete(ctx, &riverdriver.JobDeleteParams{ID: job.ID, Schema: schemaFromParams(params)}); deleteErr != nil {
 				postErr = errors.Join(postErr, fmt.Errorf("delete ephemeral job %d: %w", job.ID, deleteErr))
 			}
