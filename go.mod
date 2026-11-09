@@ -6,7 +6,7 @@ require (
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/riverqueue/river v0.51.1
 	github.com/riverqueue/river/riverdriver v0.51.1
-	github.com/riverqueue/river/riverdriver/riverdatabasesql v0.49.0
+	github.com/riverqueue/river/riverdriver/riverdatabasesql v0.51.1
 	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.51.1
 	github.com/riverqueue/river/rivershared v0.51.1
 	github.com/riverqueue/river/rivertype v0.51.1
