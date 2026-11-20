@@ -211,7 +211,7 @@ func (p *proPilot[TTx]) crashRescueOnce(ctx context.Context) (int, error) {
 	}
 }
 
-func (p *proPilot[TTx]) JobInsertMany(ctx context.Context, exec riverdriver.Executor, params *riverdriver.JobInsertFastManyParams) ([]*riverdriver.JobInsertFastResult, error) {
+func (p *proPilot[TTx]) JobInsertMany(ctx context.Context, exec riverdriver.ExecutorTx, params *riverdriver.JobInsertFastManyParams) ([]*riverdriver.JobInsertFastResult, error) {
 	if params == nil || len(params.Jobs) == 0 {
 		return p.StandardPilot.JobInsertMany(ctx, exec, params)
 	}
